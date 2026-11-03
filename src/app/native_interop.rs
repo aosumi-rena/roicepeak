@@ -1,4 +1,8 @@
 //! Typed editable import and raw-preserving native save transactions.
+#[path = "native_envelope.rs"]
+mod envelope;
+#[path = "native_fresh.rs"]
+mod fresh;
 #[path = "native_interop_options.rs"]
 mod options;
 #[path = "native_structure.rs"]
@@ -202,6 +206,19 @@ fn overlay_corrections(
     root: &mut Value,
     parameters: &BTreeMap<String, Parameters>,
 ) -> Result<(), String> {
+    let existing_emotions = root["project"]["global-emotions"]
+        .as_array()
+        .ok_or("Native correction list missing")?;
+    let needs_defaults = parameters.keys().any(|identity| {
+        !existing_emotions
+            .iter()
+            .any(|row| row["nar"].as_str() == Some(identity.as_str()))
+    });
+    let defaults = if needs_defaults {
+        envelope::zero_emotions(&root["project"]["emotions"])?
+    } else {
+        Value::Object(Map::new())
+    };
     let declared = root["voices"]
         .as_object()
         .ok_or("Native voice envelope missing")?
@@ -236,7 +253,7 @@ fn overlay_corrections(
                 let contents = if payload == "pm" {
                     scalar_object(&serde_json::json!({}), value)?
                 } else {
-                    emotion_object(&serde_json::json!({}), value)?
+                    emotion_object(&defaults, value)?
                 };
                 let mut row = Map::new();
                 row.insert("nar".into(), identity.clone().into());
@@ -248,11 +265,17 @@ fn overlay_corrections(
     Ok(())
 }
 
+pub(crate) fn requires_preparation(project: &Project) -> Result<bool, String> {
+    structure::requires_preparation(project)
+}
+
 pub(crate) fn encode(project: &Project, config: Option<&Config>) -> Result<Vec<u8>, String> {
     let mut project = project.clone();
     project.synchronize_sentences()?;
     project.validate()?;
-    let origin=project.native_origin.as_ref().ok_or("Native Save currently requires a native-origin project; choose ROICEPEAK format for a newly authored project")?;
+    let Some(origin) = project.native_origin.as_ref() else {
+        return fresh::encode(&project, config);
+    };
     if project
         .global
         .emotions
@@ -263,9 +286,27 @@ pub(crate) fn encode(project: &Project, config: Option<&Config>) -> Result<Vec<u
     }
     let mut root = origin.root().clone();
     root["project"]["params"] = scalar_object(&root["project"]["params"], &project.global)?;
-    overlay_corrections(&mut root, &project.narrator_settings)?;
+    let corrections = envelope::extend(&mut root, &project, config)?;
+    overlay_corrections(&mut root, &corrections)?;
     root["project"]["export"] =
         options::overlay(&root["project"]["export"], &project.export_settings)?;
+    let inserted = project
+        .blocks
+        .iter()
+        .filter(|block| block.native_owner.is_none())
+        .count();
+    let pool = root["project"]["emotions"]
+        .as_object()
+        .ok_or("Native emotion pool missing")?;
+    let pool_values = inserted
+        .checked_mul(pool.len())
+        .ok_or("Native emotion pool size overflow")?;
+    let pool_bytes = inserted
+        .checked_mul(serde_json::to_vec(pool).map_err(|e| e.to_string())?.len())
+        .ok_or("Native emotion pool size overflow")?;
+    if pool_values > 500_000 || pool_bytes > 16 * 1024 * 1024 {
+        return Err("Inserted native emotion pools exceed the document budget".into());
+    }
     let mut blocks = Vec::with_capacity(project.blocks.len());
     for block in &project.blocks {
         config
@@ -274,10 +315,12 @@ pub(crate) fn encode(project: &Project, config: Option<&Config>) -> Result<Vec<u
         if root["voices"].get(&block.narrator.identity).is_none() {
             return Err("Native Save cannot yet add a narrator absent from the original native voice envelope".into());
         }
-        let block_owner = block
-            .native_owner
-            .ok_or("Native Save cannot yet preserve newly inserted or split blocks")?;
-        let mut raw = origin.block(block_owner)?.clone();
+        let block_owner = block.native_owner;
+        let mut raw = if let Some(owner) = block_owner {
+            origin.block(owner)?.clone()
+        } else {
+            fresh::block_shell(block, config.unwrap(), &root["project"]["emotions"])?
+        };
         structure::overlay(origin, block_owner, block, &mut raw)?;
         raw["params"] = scalar_object(&raw["params"], &block.parameters)?;
         raw["emotions"] = emotion_object(&raw["emotions"], &block.parameters)?;

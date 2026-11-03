@@ -127,8 +127,7 @@ impl Node<'_> {
         }
         Tensor::new(rows, cols, floats(&self.payload[header..]))
     }
-    /// Float dequantization is an explicit arithmetic policy. This does not
-    /// emulate the original engine's possible integer accumulation path.
+    /// Decode packed coefficients into row-major floats.
     fn dequantized(&self) -> Result<Tensor> {
         let bits = u32_at(self.payload, 0)? as usize;
         let reserved = u32_at(self.payload, 8)?;
@@ -158,7 +157,8 @@ impl Node<'_> {
                 } else {
                     i16::from_le_bytes([packed[2 * at], packed[2 * at + 1]]) as f32
                 };
-                values[r * cols + c] = q * (scale[r] / divisor);
+                let product = q * scale[r];
+                values[r * cols + c] = product / divisor;
             }
         }
         Tensor::new(rows, cols, values)

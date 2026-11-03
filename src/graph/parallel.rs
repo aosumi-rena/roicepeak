@@ -26,36 +26,69 @@ fn pool() -> Option<&'static ThreadPool> {
     .as_ref()
 }
 
-/// The caller validates dimensions and spends its complete budget before entry.
-/// A failed pool initialization falls back to the same serial row kernel.
-pub(super) fn for_rows(
-    output: &mut [f32],
-    channels: usize,
-    macs_per_row: usize,
-    execute: impl Fn(usize, &mut [f32]) + Sync,
-) {
-    debug_assert!(channels > 0 && output.len() % channels == 0);
-    let rows = output.len() / channels;
-    if rows < 8 || rows.saturating_mul(macs_per_row) < MIN_PARALLEL_MACS {
-        execute(0, output);
-        return;
+/// Independent row chunks with a separate workspace for each callback.
+pub(super) struct FallibleRows {
+    rows: usize,
+    grain: usize,
+    pool: Option<&'static ThreadPool>,
+}
+
+impl FallibleRows {
+    pub(super) fn new(rows: usize, macs_per_row: usize) -> Self {
+        if rows < 8 || rows.saturating_mul(macs_per_row) < MIN_PARALLEL_MACS {
+            return Self {
+                rows,
+                grain: rows.max(1),
+                pool: None,
+            };
+        }
+        let Some(pool) = pool() else {
+            return Self {
+                rows,
+                grain: rows.max(1),
+                pool: None,
+            };
+        };
+        let grain = rows
+            .div_ceil(pool.current_num_threads() * 2)
+            .max(MIN_TASK_MACS.div_ceil(macs_per_row.max(1)))
+            .min(rows);
+        Self {
+            rows,
+            grain,
+            pool: if grain == rows { None } else { Some(pool) },
+        }
     }
-    let Some(pool) = pool() else {
-        execute(0, output);
-        return;
-    };
-    let grain = rows
-        .div_ceil(pool.current_num_threads() * 2)
-        .max(MIN_TASK_MACS.div_ceil(macs_per_row.max(1)))
-        .min(rows);
-    if grain == rows {
-        execute(0, output);
-        return;
+
+    /// Charge every scheduled workspace, including chunks run serially.
+    pub(super) fn chunks(&self) -> usize {
+        self.rows.div_ceil(self.grain)
     }
-    pool.install(|| {
-        output
-            .par_chunks_mut(grain * channels)
-            .enumerate()
-            .for_each(|(index, target)| execute(index * grain, target));
-    });
+
+    pub(super) fn execute(
+        &self,
+        output: &mut [f32],
+        channels: usize,
+        execute: impl Fn(usize, &mut [f32]) -> crate::Result<()> + Sync,
+    ) -> crate::Result<()> {
+        if channels == 0 || output.len() % channels != 0 || output.len() / channels != self.rows {
+            return Err(crate::invalid("row schedule dimensions"));
+        }
+        if self.rows == 0 {
+            return Ok(());
+        }
+        let Some(pool) = self.pool else {
+            return execute(0, output);
+        };
+        let chunk_elements = self
+            .grain
+            .checked_mul(channels)
+            .ok_or_else(|| crate::invalid("row schedule size overflow"))?;
+        pool.install(|| {
+            output
+                .par_chunks_mut(chunk_elements)
+                .enumerate()
+                .try_for_each(|(index, target)| execute(index * self.grain, target))
+        })
+    }
 }

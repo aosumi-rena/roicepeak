@@ -71,6 +71,7 @@ impl EditorApp {
         )?;
         self.query_basis_current = false;
         self.invalidate_audio();
+        self.native_save = None;
         self.project = project;
         self.portrait_state.clear_choices();
         self.filename = None;

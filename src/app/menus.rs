@@ -18,13 +18,17 @@ impl EditorApp {
     }
 
     pub fn request_action(&mut self, action: PendingAction, ctx: &egui::Context) {
+        if let Some(save) = &mut self.native_save {
+            save.after_save = Some(action);
+            return;
+        }
         if self.dirty {
             self.pending = Some(action);
         } else {
             self.execute_action(action, ctx);
         }
     }
-    fn execute_action(&mut self, action: PendingAction, ctx: &egui::Context) {
+    pub(crate) fn execute_action(&mut self, action: PendingAction, ctx: &egui::Context) {
         if matches!(action, PendingAction::ImportSrt | PendingAction::ImportSsml) {
             self.pending = None;
             let imported = match action {
@@ -40,6 +44,7 @@ impl EditorApp {
         self.pending = None;
         match action {
             PendingAction::New => {
+                self.native_save = None;
                 self.invalidate_audio();
                 self.history_navigation = true;
                 self.query_basis_current = false;
@@ -59,6 +64,7 @@ impl EditorApp {
             PendingAction::OpenPath(path) => self.open_path(path),
             PendingAction::ImportSrt | PendingAction::ImportSsml => unreachable!(),
             PendingAction::Quit => {
+                self.native_save = None;
                 self.invalidate_audio();
                 self.history_navigation = true;
                 self.quit_approved = true;
@@ -90,20 +96,7 @@ impl EditorApp {
                 .save_file()
         });
         if let Some(path) = path {
-            match crate::app::project_files::write(
-                &path,
-                &self.project,
-                self.render_config.as_ref(),
-            ) {
-                Ok(()) => {
-                    if let Err(error) = self.recent_projects.record(&path) {
-                        self.error = Some(error);
-                    }
-                    self.filename = Some(path);
-                    self.dirty = false;
-                }
-                Err(e) => self.error = Some(e),
-            }
+            self.request_save_path(path);
         }
     }
     pub fn open(&mut self) {
@@ -118,6 +111,7 @@ impl EditorApp {
     pub(crate) fn open_path(&mut self, path: std::path::PathBuf) {
         match crate::app::project_files::read(&path, self.render_config.as_ref()) {
             Ok(project) => {
+                self.native_save = None;
                 self.query_basis_current = false;
                 self.invalidate_audio();
                 self.history_navigation = true;
@@ -344,12 +338,18 @@ impl EditorApp {
             ) {
                 Some(0) => {
                     self.save(false);
-                    if !self.dirty {
+                    if let Some(save) = &mut self.native_save {
+                        save.after_save = Some(action);
+                        self.pending = None;
+                    } else if !self.dirty {
                         self.execute_action(action, ctx);
                     }
                 }
                 Some(1) => self.execute_action(action, ctx),
-                Some(_) => self.pending = None,
+                Some(_) => {
+                    self.pending = None;
+                    self.native_save = None;
+                }
                 None => (),
             }
         }

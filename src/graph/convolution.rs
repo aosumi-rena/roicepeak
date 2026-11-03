@@ -1,4 +1,5 @@
-use super::{Budget, matrix, payload, vector};
+use super::matrix_storage::{Accumulate, Matrix, Workspace};
+use super::{Budget, payload, vector};
 use crate::{
     Result,
     dnni::Node,
@@ -6,9 +7,33 @@ use crate::{
     tensor::{MAX_ELEMENTS, Tensor, u32_at},
 };
 
+#[path = "convolution/forward.rs"]
+mod forward;
+use forward::ForwardFloat;
+#[path = "convolution/transpose.rs"]
+mod transpose;
+use transpose::Transpose;
+
+#[derive(Debug)]
+enum Weights {
+    Packed(ForwardFloat),
+    Transposed(Transpose),
+    Matrices(Vec<Matrix>),
+}
+
+impl Weights {
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::Packed(value) => value.estimated_bytes(),
+            Self::Transposed(value) => value.estimated_bytes(),
+            Self::Matrices(taps) => crate::memory::nested(taps, Matrix::estimated_bytes),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Convolution {
-    taps: Vec<Tensor>,
+    weights: Weights,
     bias: Option<Vec<f32>>,
     stride: usize,
     padding: usize,
@@ -18,7 +43,7 @@ pub struct Convolution {
 impl Convolution {
     pub fn estimated_bytes(&self) -> usize {
         crate::memory::sum([
-            crate::memory::nested(&self.taps, Tensor::estimated_bytes),
+            self.weights.estimated_bytes(),
             crate::memory::optional(&self.bias, crate::memory::values),
         ])
     }
@@ -31,7 +56,11 @@ impl Convolution {
         }
     }
     pub(crate) fn channels(&self) -> (usize, usize) {
-        (self.taps[0].cols(), self.taps[0].rows())
+        match &self.weights {
+            Weights::Packed(value) => value.channels(),
+            Weights::Transposed(value) => value.channels(),
+            Weights::Matrices(taps) => (taps[0].cols(), taps[0].rows()),
+        }
     }
     pub(super) fn from_node(n: &Node<'_>) -> Result<Self> {
         payload(n, 20)?;
@@ -61,7 +90,7 @@ impl Convolution {
                 }
                 bias = Some(vector(child)?);
             } else {
-                taps.push(matrix(child)?);
+                taps.push(Matrix::from_node(child)?);
             }
         }
         if taps.len() != kernel {
@@ -76,109 +105,125 @@ impl Convolution {
         {
             return Err(invalid("convolution tensor dimensions differ"));
         }
+        let transpose = n.tag == "modl2";
+        let quantized = taps.iter().any(Matrix::is_quantized);
+        if !transpose && quantized && taps.iter().any(|tap| !tap.is_quantized()) {
+            return Err(invalid(
+                "mixed dense and quantized convolution taps are unsupported",
+            ));
+        }
+        if transpose && padding != 0 {
+            return Err(invalid("transpose convolution padding must be zero"));
+        }
+        let weights = if transpose {
+            Weights::Transposed(Transpose::new(taps)?)
+        } else if quantized {
+            Weights::Matrices(taps)
+        } else {
+            Weights::Packed(ForwardFloat::new(taps)?)
+        };
         Ok(Self {
-            taps,
+            weights,
             bias,
             stride,
             padding,
             dilation,
-            transpose: n.tag == "modl2",
+            transpose,
         })
     }
     pub(super) fn run(&self, x: &Tensor, budget: &mut Budget) -> Result<Tensor> {
-        let outputs = self.taps[0].rows();
-        if x.cols() != self.taps[0].cols() {
+        if let Weights::Packed(value) = &self.weights {
+            return value.run(
+                x,
+                self.stride,
+                self.padding,
+                self.dilation,
+                self.bias.as_deref(),
+                budget,
+            );
+        }
+        if let Weights::Transposed(value) = &self.weights {
+            return value.run(x, self.stride, self.dilation, self.bias.as_deref(), budget);
+        }
+        let Weights::Matrices(taps) = &self.weights else {
+            unreachable!("float convolution returned before matrix execution");
+        };
+        let outputs = taps[0].rows();
+        if x.cols() != taps[0].cols() {
             return Err(invalid("convolution input dimension"));
         }
-        let span = (self.taps.len() - 1)
+        let span = (taps.len() - 1)
             .checked_mul(self.dilation)
             .and_then(|v| v.checked_add(1))
             .ok_or_else(|| invalid("convolution span overflow"))?;
-        let full = if self.transpose {
-            if x.rows() == 0 {
-                0
-            } else {
-                (x.rows() - 1)
-                    .checked_mul(self.stride)
-                    .and_then(|v| v.checked_add(span))
-                    .ok_or_else(|| invalid("convolution frame overflow"))?
-            }
-        } else {
+        let padded = x
+            .rows()
+            .checked_add(2 * self.padding)
+            .ok_or_else(|| invalid("convolution padding overflow"))?;
+        let frames = if padded < span {
             0
-        };
-        let frames = if self.transpose {
-            full.saturating_sub(2 * self.padding)
         } else {
-            let padded = x
-                .rows()
-                .checked_add(2 * self.padding)
-                .ok_or_else(|| invalid("convolution padding overflow"))?;
-            if padded < span {
-                0
-            } else {
-                (padded - span) / self.stride + 1
-            }
+            (padded - span) / self.stride + 1
         };
-        let macs = (if self.transpose { x.rows() } else { frames })
+        let macs = frames
             .saturating_mul(outputs)
             .saturating_mul(x.cols())
-            .saturating_mul(self.taps.len());
-        budget.spend(macs, frames.saturating_mul(outputs))?;
-        let mut y = Tensor::zeros(frames, outputs)?;
-        if self.transpose {
-            if let Some(b) = &self.bias {
-                for t in 0..frames {
-                    y.row_mut(t).copy_from_slice(b);
-                }
-            }
-            for t in 0..x.rows() {
-                for (k, tap) in self.taps.iter().enumerate() {
-                    let at = t * self.stride + k * self.dilation;
-                    if at < self.padding || at >= full.saturating_sub(self.padding) {
-                        continue;
-                    }
-                    accumulate(tap, x.row(t), y.row_mut(at - self.padding));
-                }
-            }
+            .saturating_mul(taps.len());
+        self.run_quantized(taps, x, frames, macs, budget)
+    }
+    fn run_quantized(
+        &self,
+        taps: &[Matrix],
+        input: &Tensor,
+        frames: usize,
+        macs: usize,
+        budget: &mut Budget,
+    ) -> Result<Tensor> {
+        let outputs = taps[0].rows();
+        let macs_per_row = outputs
+            .saturating_mul(input.cols())
+            .saturating_mul(taps.len());
+        let plan = super::parallel::FallibleRows::new(frames, macs_per_row);
+        let scratch = if frames == 0 {
+            0
         } else {
-            let macs_per_row = outputs
-                .saturating_mul(x.cols())
-                .saturating_mul(self.taps.len());
-            super::parallel::for_rows(y.values_mut(), outputs, macs_per_row, |first, target| {
-                for (offset, row) in target.chunks_exact_mut(outputs).enumerate() {
-                    let t = first + offset;
-                    for (k, tap) in self.taps.iter().enumerate() {
-                        let at = t * self.stride + k * self.dilation;
-                        if at < self.padding || at - self.padding >= x.rows() {
-                            continue;
-                        }
-                        let input = x.row(at - self.padding);
-                        accumulate(tap, input, row);
-                    }
-                    if let Some(b) = &self.bias {
-                        for (v, b) in row.iter_mut().zip(b) {
-                            *v += b;
-                        }
+            taps[0]
+                .workspace_elements()
+                .saturating_mul(plan.chunks())
+                .saturating_add(input.cols())
+        };
+        budget.spend(macs, frames.saturating_mul(outputs).saturating_add(scratch))?;
+        let mut output = Tensor::zeros(frames, outputs)?;
+        if frames == 0 {
+            return Ok(output);
+        }
+        let zero = vec![0.0; input.cols()];
+        plan.execute(output.values_mut(), outputs, |first, target| {
+            let mut workspace = Workspace::default();
+            for (offset, row) in target.chunks_exact_mut(outputs).enumerate() {
+                let time = first + offset;
+                for (index, tap) in taps.iter().enumerate() {
+                    let at = time * self.stride + index * self.dilation;
+                    let source = if at < self.padding || at - self.padding >= input.rows() {
+                        zero.as_slice()
+                    } else {
+                        input.row(at - self.padding)
+                    };
+                    let mode = if index == 0 {
+                        Accumulate::Replace
+                    } else {
+                        Matrix::add_mode()
+                    };
+                    tap.quantized_product_into(source, row, mode, &mut workspace)?;
+                }
+                if let Some(bias) = &self.bias {
+                    for (value, bias) in row.iter_mut().zip(bias) {
+                        *value += bias;
                     }
                 }
-            });
-        }
-        Ok(y)
-    }
-}
-
-fn accumulate(tap: &Tensor, input: &[f32], output: &mut [f32]) {
-    let grouped = output.len() / 4 * 4;
-    for o in (0..grouped).step_by(4) {
-        let sums = super::dot4(
-            [tap.row(o), tap.row(o + 1), tap.row(o + 2), tap.row(o + 3)],
-            input,
-        );
-        for lane in 0..4 {
-            output[o + lane] += sums[lane];
-        }
-    }
-    for o in grouped..output.len() {
-        output[o] += super::dot(tap.row(o), input);
+            }
+            Ok(())
+        })?;
+        Ok(output)
     }
 }

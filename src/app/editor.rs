@@ -70,6 +70,7 @@ pub struct EditorApp {
     pub reorder: Option<u64>,
     pub history_navigation: bool,
     pub pending: Option<PendingAction>,
+    pub(crate) native_save: Option<crate::app::native_save::Pending>,
     pub quit_approved: bool,
     pub player: crate::app::audio::Player,
     pub rendered_audio: std::sync::Arc<Vec<f32>>,
@@ -161,6 +162,7 @@ impl EditorApp {
             reorder: None,
             history_navigation: false,
             pending: None,
+            native_save: None,
             quit_approved: false,
             player: crate::app::audio::Player::default(),
             rendered_audio: std::sync::Arc::default(),
@@ -369,9 +371,16 @@ impl eframe::App for EditorApp {
             self.transport = crate::app::transport::Transport::Paused;
             self.error = Some(error);
         }
-        if context.input(|i| i.viewport().close_requested()) && self.dirty && !self.quit_approved {
+        if context.input(|i| i.viewport().close_requested())
+            && (self.dirty || self.native_save.is_some())
+            && !self.quit_approved
+        {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.pending = Some(PendingAction::Quit);
+            if let Some(save) = &mut self.native_save {
+                save.after_save = Some(PendingAction::Quit);
+            } else {
+                self.pending = Some(PendingAction::Quit);
+            }
         }
         self.dispatch_shortcuts(&context);
         self.isolate_alert_focus(&context);
@@ -512,6 +521,7 @@ impl eframe::App for EditorApp {
                 self.error = Some(error);
             }
         }
+        self.poll_native_save(&context);
         let tooltip_enabled = self.pending.is_none()
             && self.error.is_none()
             && !self.about

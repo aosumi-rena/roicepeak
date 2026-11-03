@@ -4,6 +4,9 @@ use eframe::egui;
 
 impl EditorApp {
     pub(crate) fn prepare_project(&mut self) {
+        if self.native_save.is_some() {
+            return;
+        }
         let Some(config) = self.render_config.clone() else {
             return;
         };
@@ -40,6 +43,10 @@ impl EditorApp {
         let Some(result) = self.render_worker.poll_prepare() else {
             return;
         };
+        if self.save_preparation_pending() {
+            self.accept_save_preparation(result, ctx);
+            return;
+        }
         let result = match result {
             Ok(result)
                 if result.source.same_content(&self.project)

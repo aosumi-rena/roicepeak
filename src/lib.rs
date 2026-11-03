@@ -1,5 +1,5 @@
 //! Independent scalar inference on explicitly supplied plain model graphs.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod acoustic;
 pub mod activation;

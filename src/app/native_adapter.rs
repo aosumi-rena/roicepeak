@@ -3,6 +3,8 @@
 pub(crate) mod fields;
 #[path = "native_adapter_manual.rs"]
 mod manual;
+#[path = "native_retained_text.rs"]
+mod retained_text;
 use crate::app::{
     document::{OffsetMode, VoiceRef, VoiceVersion, WordState},
     native_project::NativeProject,
@@ -267,11 +269,40 @@ pub(crate) fn overlay_sentence(
     sentence: &crate::app::document::SentenceState,
 ) -> Result<serde_json::Value, String> {
     let draft = manual::decode(original, sentence.id, "/native-sentence")?;
-    if draft.state().text != sentence.text || sentence.ssml.is_some() {
-        return Err(
-            "Native Save cannot yet preserve changed sentence text or pending SSML annotations"
-                .into(),
-        );
+    if sentence.ssml.is_some() {
+        return Err("Native Save cannot yet preserve pending SSML annotations".into());
     }
-    draft.overlay_manual(&sentence.words)
+    let mut value = draft.overlay_manual(&sentence.words)?;
+    if draft.state().text != sentence.text {
+        retained_text::overlay(&mut value, sentence)?;
+    }
+    Ok(value)
+}
+
+pub(crate) fn preserves_word_structure(
+    original: &serde_json::Value,
+    sentence: &crate::app::document::SentenceState,
+) -> Result<bool, String> {
+    manual::decode(original, sentence.id, "/native-sentence")?.preserves_structure(&sentence.words)
+}
+
+pub(crate) fn preserves_pronunciation_input(
+    original: &serde_json::Value,
+    sentence: &crate::app::document::SentenceState,
+) -> Result<bool, String> {
+    let source = manual::decode(original, sentence.id, "/native-sentence")?;
+    if !source.preserves_structure(&sentence.words)? {
+        return Ok(false);
+    }
+    Ok(source
+        .state()
+        .words
+        .iter()
+        .zip(
+            sentence
+                .words
+                .iter()
+                .filter(|word| !matches!(word.pos, 0x2000 | 0x2001)),
+        )
+        .all(|(a, b)| a.pronunciation_edited == b.pronunciation_edited))
 }

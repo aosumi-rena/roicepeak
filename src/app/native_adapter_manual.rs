@@ -242,7 +242,7 @@ impl NativeSentenceDraft {
     }
     /// Update authored values while keeping native ranges and opaque properties.
     /// Structural/text edits require the separate origin-projection adapter.
-    pub fn overlay_manual(&self, words: &[WordState]) -> Result<Value, String> {
+    pub fn preserves_structure(&self, words: &[WordState]) -> Result<bool, String> {
         let source = &self.state.words;
         let boundary = |word: &WordState| matches!(word.pos, 0x2000 | 0x2001);
         if source.iter().any(boundary) {
@@ -263,7 +263,7 @@ impl NativeSentenceDraft {
         }
         let words = ordinary;
         if source.len() != words.len() {
-            return Err("Native word structure changed; origin projection is required".into());
+            return Ok(false);
         }
         let mut budget = crate::app::sentence_edit::ValidationBudget::default();
         for (a, b) in source.iter().zip(&words) {
@@ -281,9 +281,21 @@ impl NativeSentenceDraft {
                             .any(|(a, b)| a.symbol != b.symbol || a.nucleus != b.nucleus)
                 })
             {
-                return Err("Native word structure changed; origin projection is required".into());
+                return Ok(false);
             }
         }
+        Ok(true)
+    }
+
+    pub fn overlay_manual(&self, words: &[WordState]) -> Result<Value, String> {
+        if !self.preserves_structure(words)? {
+            return Err("Native word structure changed; origin projection is required".into());
+        }
+        let source = &self.state.words;
+        let words = words
+            .iter()
+            .filter(|word| !matches!(word.pos, 0x2000 | 0x2001))
+            .collect::<Vec<_>>();
         let mut value = self.original.clone();
         let tokens = value["tokens"].as_array_mut().unwrap();
         for ((source_word, word), target) in source.iter().zip(&words).zip(tokens) {

@@ -149,14 +149,182 @@ fn edited(project: &Project, edit: &Edit) -> Result<(Project, Value), String> {
     ))
 }
 
+fn same_parameters(a: &Parameters, b: &Parameters) -> bool {
+    [
+        a.speed.bits(),
+        a.pitch.bits(),
+        a.pause.bits(),
+        a.volume.bits(),
+    ] == [
+        b.speed.bits(),
+        b.pitch.bits(),
+        b.pause.bits(),
+        b.volume.bits(),
+    ] && a.emotions.keys().chain(b.emotions.keys()).all(|key| {
+        a.emotions
+            .get(key)
+            .copied()
+            .unwrap_or(ControlValue::ZERO)
+            .bits()
+            == b.emotions
+                .get(key)
+                .copied()
+                .unwrap_or(ControlValue::ZERO)
+                .bits()
+    })
+}
+
+fn fresh_roundtrip(
+    config: &Config,
+    config_path: &Path,
+    config_bytes: &[u8],
+    input_path: &Path,
+    input: &[u8],
+    directory: &Path,
+) -> Result<(), String> {
+    let project: Project = serde_json::from_slice(input).map_err(|e| e.to_string())?;
+    project.validate()?;
+    if project.native_origin.is_some() {
+        return Err("--new-project requires an own project without a native origin".into());
+    }
+    controls_budget(&project)?;
+    let own = own_bytes(&project)?;
+    let encoded = native_interop::encode(&project, Some(config))?;
+    let native = NativeProject::parse(&encoded)?;
+    let root = native.root().clone();
+    let decoded = native_interop::decode(native, Some(config))?;
+    controls_budget(&decoded)?;
+    let roundtrip = native_interop::encode(&decoded, Some(config))?;
+    if roundtrip != encoded
+        || !same_parameters(&project.global, &decoded.global)
+        || project.blocks.len() != decoded.blocks.len()
+    {
+        return Err("New native round trip changed its stored controls or structure".into());
+    }
+    for identity in project
+        .narrator_settings
+        .keys()
+        .chain(decoded.narrator_settings.keys())
+    {
+        let neutral = Parameters::default();
+        if !same_parameters(
+            project.narrator_settings.get(identity).unwrap_or(&neutral),
+            decoded.narrator_settings.get(identity).unwrap_or(&neutral),
+        ) {
+            return Err("New native round trip changed narrator controls".into());
+        }
+    }
+    let mut export = project.export_settings.clone();
+    export.name = decoded.export_settings.name.clone();
+    if export != decoded.export_settings {
+        return Err("New native round trip changed stored export settings".into());
+    }
+    let mut expected_project = project.clone();
+    expected_project.synchronize_sentences()?;
+    for (before, after) in expected_project.blocks.iter().zip(&decoded.blocks) {
+        if before.text != after.text
+            || before.narrator != after.narrator
+            || before.offset_mode != after.offset_mode
+            || before.offset_seconds.to_bits() != after.offset_seconds.to_bits()
+            || !same_parameters(&before.parameters, &after.parameters)
+        {
+            return Err("New native round trip changed a block".into());
+        }
+        if before.text.trim().is_empty() {
+            let partition = crate::app::sentences::partition(&before.text);
+            if partition.len() != after.sentences.len()
+                || partition
+                    .iter()
+                    .zip(&after.sentences)
+                    .any(|(range, sentence)| {
+                        before.text.get(range.bytes.clone()) != Some(sentence.text.as_str())
+                            || !sentence.words.is_empty()
+                    })
+            {
+                return Err("Whitespace-only text acquired native words".into());
+            }
+            continue;
+        }
+        if before.sentences.len() != after.sentences.len() {
+            return Err("New native round trip changed sentence boundaries".into());
+        }
+        for (before, after) in before.sentences.iter().zip(&after.sentences) {
+            let expected = before
+                .words
+                .iter()
+                .enumerate()
+                .filter_map(|(index, word)| {
+                    if matches!(word.pos, 0x2000 | 0x2001) {
+                        return None;
+                    }
+                    let mut word = word.clone();
+                    for (mora, baseline) in word
+                        .morae
+                        .iter_mut()
+                        .zip(&before.query.predicted[index].morae)
+                    {
+                        if !mora.accent_edited {
+                            mora.code = baseline.code;
+                        }
+                        mora.prediction_eligible = baseline.prediction_eligible;
+                    }
+                    Some(word)
+                })
+                .collect::<Vec<_>>();
+            if before.text != after.text
+                || serde_json::to_vec(&expected).map_err(|e| e.to_string())?
+                    != serde_json::to_vec(&after.words).map_err(|e| e.to_string())?
+            {
+                return Err("New native round trip changed stored word controls".into());
+            }
+        }
+    }
+    let reopened_own = own_bytes(&decoded)?;
+    let report = json!({"operation":"new-native-project-roundtrip","input":input_path,
+        "input_sha256":digest(input),"native_origin_was_present":false,
+        "native_encode_sha256":digest(&encoded),"native_roundtrip_exact":true,
+        "source_controls":controls(&project),"decoded_controls":controls(&decoded),"document":root,
+        "native_editor_acceptance_qualified":false});
+    let report = serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?;
+    if report.len() > REPORT_LIMIT {
+        return Err("New native report exceeds its byte budget".into());
+    }
+    if bounded(config_path, 65536)? != config_bytes || bounded(input_path, DOCUMENT_LIMIT)? != input
+    {
+        return Err("An explicit new-project diagnostic input changed before output".into());
+    }
+    for (name, bytes) in [
+        ("source.roicepeak", own.as_slice()),
+        ("fresh.vpp", encoded.as_slice()),
+        ("reopened.roicepeak", reopened_own.as_slice()),
+        ("roundtrip.vpp", roundtrip.as_slice()),
+        ("report.json", report.as_slice()),
+    ] {
+        write_new(&directory.join(name), bytes)?;
+    }
+    if bounded(config_path, 65536)? != config_bytes || bounded(input_path, DOCUMENT_LIMIT)? != input
+    {
+        return Err("An explicit new-project diagnostic input changed during output".into());
+    }
+    println!(
+        "{}",
+        json!({"operation":"new-native-project-roundtrip","native_encode_sha256":digest(&encoded),
+        "blocks":decoded.blocks.len(),"native_origin_was_present":false,"native_roundtrip_exact":true,
+        "native_editor_acceptance_qualified":false})
+    );
+    Ok(())
+}
+
 pub(super) fn run(args: &[OsString]) -> Result<(), String> {
-    if !(args.len() == 3 || args.len() == 4)
+    let prepared_mode = args.len() == 5 && args[3] == "--prepared-project";
+    let fresh_mode = args.len() == 4 && args[3] == "--new-project";
+    if !(args.len() == 3 || args.len() == 4 || prepared_mode)
         || args.iter().any(|a| {
             a.to_str()
                 .is_none_or(|text| text.is_empty() || text.encode_utf16().count() > 32768)
         })
     {
-        return Err("Usage: roicepeak --inspect-native-editable LOCATIONS.json INPUT.vpp EXISTING_OUTPUT_DIRECTORY [EDIT.json]".into());
+        return Err("Usage: roicepeak --inspect-native-editable LOCATIONS.json INPUT EXISTING_OUTPUT_DIRECTORY [EDIT.json | --prepared-project PREPARED.roicepeak | --new-project]".into());
     }
     let mut gate = Vec::new();
     std::io::stdin()
@@ -175,7 +343,15 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
     if !directory.is_dir() {
         return Err("Output must be an existing directory".into());
     }
-    let names: Vec<&str> = if args.len() == 4 {
+    let names: Vec<&str> = if fresh_mode {
+        vec![
+            "source.roicepeak",
+            "fresh.vpp",
+            "reopened.roicepeak",
+            "roundtrip.vpp",
+            "report.json",
+        ]
+    } else if args.len() >= 4 {
         vec![
             "roundtrip.roicepeak",
             "roundtrip.vpp",
@@ -198,9 +374,12 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
     }
     let config_bytes = bounded(config_path, 65536)?;
     let input = bounded(input_path, DOCUMENT_LIMIT)?;
-    let edit_bytes = args
-        .get(3)
-        .map(|path| bounded(Path::new(path), 4096))
+    let prepared_path = prepared_mode.then(|| Path::new(&args[4]));
+    let prepared_bytes = prepared_path
+        .map(|path| bounded(path, DOCUMENT_LIMIT))
+        .transpose()?;
+    let edit_bytes = (args.len() == 4 && !fresh_mode)
+        .then(|| bounded(Path::new(&args[3]), 4096))
         .transpose()?;
     let edit: Option<Edit> = edit_bytes
         .as_deref()
@@ -217,6 +396,16 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
         &catalog,
     )?;
     config.value_policy = locations.value_policy();
+    if fresh_mode {
+        return fresh_roundtrip(
+            &config,
+            config_path,
+            &config_bytes,
+            input_path,
+            &input,
+            &directory,
+        );
+    }
     let native = NativeProject::parse(&input)?;
     let original_root = native.root().clone();
     let project = native_interop::decode(native, Some(&config))?;
@@ -231,15 +420,31 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
     }
     let own = own_bytes(&project)?;
     // Validate every requested edit and stage its native output before first write.
-    let optional = edit
-        .as_ref()
-        .map(|edit| {
-            let (project, edit_report) = edited(&project, edit)?;
-            let own = own_bytes(&project)?;
-            let native = native_interop::encode(&project, Some(&config))?;
-            Ok::<_, String>((project, own, native, edit_report))
-        })
-        .transpose()?;
+    let optional = if let Some(path) = prepared_path {
+        let prepared = Project::read(path)?;
+        controls_budget(&prepared)?;
+        if !origin_matches(&prepared, &input, &original_root) {
+            return Err("Prepared project does not belong to the supplied native input".into());
+        }
+        let own = own_bytes(&prepared)?;
+        // Production Save performs the accepted-query, lexical-topology and range checks.
+        let native = native_interop::encode(&prepared, Some(&config))?;
+        Some((
+            prepared,
+            own,
+            native,
+            json!({"scope":"prepared-own-project"}),
+        ))
+    } else {
+        edit.as_ref()
+            .map(|edit| {
+                let (project, edit_report) = edited(&project, edit)?;
+                let own = own_bytes(&project)?;
+                let native = native_interop::encode(&project, Some(&config))?;
+                Ok::<_, String>((project, own, native, edit_report))
+            })
+            .transpose()?
+    };
     if bounded(config_path, 65536)? != config_bytes || bounded(input_path, DOCUMENT_LIMIT)? != input
     {
         return Err("An explicit diagnostic input changed before output".into());
@@ -247,6 +452,11 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
     if let Some(bytes) = &edit_bytes {
         if bounded(Path::new(&args[3]), 4096)? != *bytes {
             return Err("Edit request changed before output".into());
+        }
+    }
+    if let Some((path, bytes)) = prepared_path.zip(prepared_bytes.as_ref()) {
+        if bounded(path, DOCUMENT_LIMIT)? != *bytes {
+            return Err("Prepared project changed before output".into());
         }
     }
     // Same validated own serialization as Project::write, guarded by create_new.
@@ -298,17 +508,25 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
             return Err("Edit request changed during round trip".into());
         }
     }
+    if let Some((path, bytes)) = prepared_path.zip(prepared_bytes.as_ref()) {
+        if bounded(path, DOCUMENT_LIMIT)? != *bytes {
+            return Err("Prepared project changed during round trip".into());
+        }
+    }
     let report = json!({"schema":"roicepeak.native-editable-diagnostic.v1","project_format":12,
         "input":{"path":input_path,"bytes":input.len(),"sha256":digest(&input)},
         "locations":{"path":config_path,"sha256":digest(&config_bytes),
             "allow_out_of_range":config.value_policy.allow_out_of_range,
             "allow_negative":config.value_policy.allow_negative},
         "edit_input":edit_bytes.as_ref().map(|bytes|json!({"bytes":bytes.len(),"sha256":digest(bytes)})),
+        "prepared_input":prepared_bytes.as_ref().map(|bytes|json!({"path":prepared_path,
+            "bytes":bytes.len(),"sha256":digest(bytes)})),
         "catalog":{"voices":catalog.voices.len(),"problems":catalog.problems},
         "before_controls":initial_bits,"reopened_controls":reopened_bits,
         "no_op_native_bytes_equal":true,"own_reopen_equal":true,"origin_unchanged":true,
         "edited":edit_report,"artifacts":artifacts,
-        "scope":{"typed_roundtrip":true,"synthesis_executed":false,"native_editor_used":false,
+        "scope":{"typed_roundtrip":true,"prepared_project_loaded":prepared_mode,
+            "synthesis_executed":false,"native_editor_used":false,
             "native_editor_acceptance_qualified":false,"unicode_or_structural_projection_qualified":false,
             "preferences_loaded_or_saved":false,"user_dictionary_loaded":false}});
     let bytes = serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?;

@@ -1,45 +1,112 @@
-//! Native-origin sentence-list projection for complete-sentence deletions.
+//! Owner-bound native blocks and sentence composition.
+use super::fresh;
 use crate::app::{
-    document::Block,
+    document::{Block, Project, SentenceState},
     native_adapter,
     native_origin::{NativeOrigin, NativeOwner},
     sentences,
 };
 use serde_json::Value;
-use std::collections::BTreeMap;
 
-fn source_text(values: &[Value]) -> Result<String, String> {
-    values
-        .iter()
-        .map(|value| {
-            value["text"]
-                .as_str()
-                .ok_or_else(|| "Native source sentence text missing".to_owned())
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|parts| parts.concat())
-}
-
-fn matches_partition<'a>(text: &str, texts: impl IntoIterator<Item = &'a str>) -> bool {
-    let partition = sentences::partition(text);
-    let texts = texts.into_iter().collect::<Vec<_>>();
-    partition.len() == texts.len()
+fn matches_partition(block: &Block) -> bool {
+    let partition = sentences::partition(&block.text);
+    partition.len() == block.sentences.len()
         && partition
             .iter()
-            .zip(texts)
-            .all(|(range, expected)| text.get(range.bytes.clone()) == Some(expected))
+            .zip(&block.sentences)
+            .all(|(range, sentence)| {
+                block.text.get(range.bytes.clone()) == Some(sentence.text.as_str())
+            })
+}
+
+pub(super) fn requires_preparation(project: &Project) -> Result<bool, String> {
+    project.validate()?;
+    if project.blocks.iter().any(|block| {
+        block.text.trim().is_empty()
+            && block
+                .sentences
+                .iter()
+                .any(|sentence| sentence.ssml.is_some())
+    }) {
+        return Err(
+            "Pending pronunciation on whitespace-only text cannot be prepared for Native Save"
+                .into(),
+        );
+    }
+    for block in &project.blocks {
+        if block.text.trim().is_empty() {
+            continue;
+        }
+        if block.native_owner.is_none() || block.sentences.is_empty() {
+            return Ok(true);
+        }
+        for sentence in &block.sentences {
+            if sentence.ssml.is_some() {
+                return Ok(true);
+            }
+            if sentence.text.trim().is_empty() {
+                continue;
+            }
+            let (Some(origin), Some(owner)) =
+                (project.native_origin.as_ref(), sentence.native_owner)
+            else {
+                return Ok(true);
+            };
+            let original = origin.sentence(owner)?;
+            if original["text"].as_str() != Some(sentence.text.as_str())
+                || !native_adapter::preserves_pronunciation_input(original, sentence)?
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn sentence(origin: &NativeOrigin, current: &SentenceState) -> Result<Value, String> {
+    let Some(owner) = current.native_owner else {
+        return fresh::new_sentence(current);
+    };
+    let original = origin.sentence(owner)?;
+    let same_words = native_adapter::preserves_word_structure(original, current)?;
+    let changed_text = original["text"].as_str() != Some(current.text.as_str());
+    if current.text.trim().is_empty() && (changed_text || !same_words) {
+        let replacement = fresh::replacement_sentence(current)?;
+        let mut value = original.clone();
+        for key in ["text", "has-eos", "tokens"] {
+            value[key] = replacement[key].clone();
+        }
+        return Ok(value);
+    }
+    if same_words {
+        if !current.text.trim().is_empty()
+            && (changed_text || !native_adapter::preserves_pronunciation_input(original, current)?)
+        {
+            // Validation uses the whole accepted query; the retained overlay
+            // still owns its original opaque word/mora/phone properties.
+            fresh::replacement_sentence(current)?;
+        }
+        return native_adapter::overlay_sentence(original, current);
+    }
+    // The old token nodes are removed as a whole. No token subtree is guessed
+    // to belong to a different lexical or phonological sequence.
+    let replacement = fresh::replacement_sentence(current)?;
+    let mut value = original.clone();
+    for key in ["text", "has-eos", "tokens"] {
+        value[key] = replacement[key].clone();
+    }
+    Ok(value)
 }
 
 pub(super) fn overlay(
     origin: &NativeOrigin,
-    block_owner: NativeOwner,
+    block_owner: Option<NativeOwner>,
     block: &Block,
     raw: &mut Value,
 ) -> Result<(), String> {
     let originals = raw["sentence-list"]
         .as_array()
         .ok_or("Native source sentence list missing")?;
-    let original_text = source_text(originals)?;
     let mut remainder = block.text.as_str();
     for sentence in &block.sentences {
         remainder = remainder
@@ -49,82 +116,57 @@ pub(super) fn overlay(
     if !remainder.is_empty() {
         return Err("Native Save requires synchronized sentence text".into());
     }
-    let mut unchanged_structure = originals.len() == block.sentences.len();
-    if unchanged_structure {
-        for (index, sentence) in block.sentences.iter().enumerate() {
-            if Some(origin.sentence_owner_in_block(block_owner, index)?) != sentence.native_owner {
-                unchanged_structure = false;
-                break;
+    let unchanged = if let Some(owner) = block_owner {
+        if originals.len() != block.sentences.len() {
+            false
+        } else {
+            let mut same = true;
+            for (index, current) in block.sentences.iter().enumerate() {
+                if current.native_owner != Some(origin.sentence_owner_in_block(owner, index)?)
+                    || originals[index]["text"].as_str() != Some(current.text.as_str())
+                {
+                    same = false;
+                    break;
+                }
             }
+            same
         }
+    } else {
+        false
+    };
+    if !unchanged && !matches_partition(block) {
+        return Err(
+            "Native Save requires ordinary sentence boundaries for changed structure or text"
+                .into(),
+        );
     }
-    if !unchanged_structure {
-        // This branch accepts a strict subsequence only: no fresh, moved, split,
-        // reordered or text-substituted sentence has a qualified writer here.
-        if block.sentences.is_empty() {
-            return Err(
-                "Native Save cannot yet qualify deleting the last sentence of a block".into(),
-            );
-        }
-        if block.sentences.len() >= originals.len() {
-            return Err(
-                "Native Save supports only complete-sentence deletion for changed structure".into(),
-            );
-        }
-        if !matches_partition(
-            &original_text,
-            originals
-                .iter()
-                .map(|value| value["text"].as_str().unwrap()),
-        ) || !matches_partition(
-            &block.text,
-            block
-                .sentences
-                .iter()
-                .map(|sentence| sentence.text.as_str()),
-        ) {
-            return Err(
-                "Native Save sentence deletion requires ordinary delimiter-partition boundaries"
-                    .into(),
-            );
-        }
-        let indices = (0..originals.len())
-            .map(|index| {
-                origin
-                    .sentence_owner_in_block(block_owner, index)
-                    .map(|owner| (owner, index))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let mut previous = None;
-        for sentence in &block.sentences {
-            let index = sentence
-                .native_owner
-                .and_then(|owner| indices.get(&owner).copied())
-                .ok_or("Native Save cannot yet add or move a sentence into this block")?;
-            if previous.is_some_and(|last| index <= last) {
-                return Err("Native Save cannot yet reorder or duplicate sentence owners".into());
-            }
-            if originals[index]["text"].as_str() != Some(sentence.text.as_str()) {
+    if block.text.trim().is_empty()
+        && block
+            .segments
+            .iter()
+            .any(|s| s.accent_edited || s.intonation_delta != 0.0 || s.duration_edit.edited())
+    {
+        for current in &block.sentences {
+            let replaces = if let Some(owner) = current.native_owner {
+                let original = origin.sentence(owner)?;
+                original["text"].as_str() != Some(current.text.as_str())
+                    || !native_adapter::preserves_word_structure(original, current)?
+            } else {
+                true
+            };
+            if replaces {
                 return Err(
-                    "Native Save cannot yet regenerate changed sentence text or word ranges".into(),
+                    "Whitespace-only text cannot retain authored pronunciation controls".into(),
                 );
             }
-            previous = Some(index);
         }
-    } else if original_text != block.text {
-        return Err("Native Save cannot yet regenerate changed text or word ranges".into());
     }
     let values = block
         .sentences
         .iter()
-        .map(|sentence| {
-            let owner = sentence
-                .native_owner
-                .ok_or("Native Save cannot yet create a sentence")?;
-            native_adapter::overlay_sentence(origin.sentence(owner)?, sentence)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let ranges = if unchanged_structure {
+        .map(|s| sentence(origin, s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let ranges = if unchanged {
         None
     } else {
         Some(
@@ -140,7 +182,6 @@ pub(super) fn overlay(
                 .collect::<Result<Vec<_>, String>>()?,
         )
     };
-    // All fallible work finishes before modifying the caller's cloned raw block.
     raw["sentence-list"] = Value::Array(values);
     if let Some(ranges) = ranges {
         raw["sentence-ranges"] = Value::Array(ranges);
