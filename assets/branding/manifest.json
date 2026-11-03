@@ -1,0 +1,94 @@
+{
+  "name": "ROICEPEAK",
+  "blue": "#1b2b79",
+  "master": "logo.svg",
+  "windows_icon_sizes": [
+    16,
+    20,
+    24,
+    32,
+    40,
+    48,
+    64,
+    96,
+    128,
+    256
+  ],
+  "assets": [
+    {
+      "file": "app-icon-256.png",
+      "bytes": 8981,
+      "sha256": "b0a9c281c3590d2787ca536d9a1d14c58395401d0d796f049bd61169fdd2de2a"
+    },
+    {
+      "file": "app-icon.icns",
+      "bytes": 118345,
+      "sha256": "c26b5f30d746b490fadcc168a3027449861aa64567678b7d213b7d3633b66f8c"
+    },
+    {
+      "file": "app-icon.ico",
+      "bytes": 25020,
+      "sha256": "9f42f1548e8351fc31ddbd1be28ab8a1e0bcf598febf9bc1f4aa84496d2e2a3c"
+    },
+    {
+      "file": "app-icon.png",
+      "bytes": 41695,
+      "sha256": "1eb462a817a58513e997c36f20088d46d819033052fba91a8c4b104d63915bb0"
+    },
+    {
+      "file": "app-icon.rc",
+      "bytes": 23,
+      "sha256": "2ab13ef48d2b9affd34c309ccfb7158853b833851d4d5131f9c46f7ef979e96b"
+    },
+    {
+      "file": "app-icon.svg",
+      "bytes": 10952,
+      "sha256": "f2b237f691624672b77aaec43279957cfa9d509e29742c3d7982878d55ac3f0c"
+    },
+    {
+      "file": "logo-black.png",
+      "bytes": 24463,
+      "sha256": "c57fc91e3ed64629f86b78c4fe24af12e3c1b9d98a5b1ae90a74a5308d0aa2d0"
+    },
+    {
+      "file": "logo-black.svg",
+      "bytes": 10877,
+      "sha256": "b2a19ed8a170370823ec1e516e7c3f05c0b92412e9b1cd3669fa82276a361d83"
+    },
+    {
+      "file": "logo-blue.png",
+      "bytes": 33092,
+      "sha256": "de70780b2e757fd4faf93f118b0b59383f81a69d009460606b145c953f2b55dd"
+    },
+    {
+      "file": "logo-blue.svg",
+      "bytes": 10877,
+      "sha256": "0a8c0944c6fa2411a6a43ffc2bae1d1cd3c3912b164e72ad3d633736dd646ea9"
+    },
+    {
+      "file": "logo-on-white.png",
+      "bytes": 31582,
+      "sha256": "83ac4fef2724e6e893e28e87ef0345c070e58920e9f808e9416ea5a90d8b513b"
+    },
+    {
+      "file": "logo-on-white.svg",
+      "bytes": 10952,
+      "sha256": "16038a53f6148d747bee7b9b3ef815c7c59aaf5fa29be1b969e963befa397245"
+    },
+    {
+      "file": "logo.png",
+      "bytes": 26604,
+      "sha256": "ddc880a56df447fd6583e697c3f8739a265e9d96999d0b14fe7aefa89bf96180"
+    },
+    {
+      "file": "logo.svg",
+      "bytes": 10836,
+      "sha256": "8a3a584d70c2e45bc317f524f52aec12fe6e04bcf3943e97bbcd460515a00922"
+    },
+    {
+      "file": "wordmark.svg",
+      "bytes": 3230,
+      "sha256": "864dd7ea59d994608fd31ff58a3abf9d7b21de9d754f1a3cbe3b87a0588960db"
+    }
+  ]
+}

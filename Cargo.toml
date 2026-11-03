@@ -1,0 +1,50 @@
+[package]
+name = "roicepeak"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+description = "Independent Rust speech editor and inference engine"
+publish = false
+default-run = "roicepeak"
+
+[[bin]]
+name = "roicepeak-synth"
+path = "src/synthesis_cli.rs"
+
+[dependencies]
+rayon = "=1.12.0"
+roxmltree = { version = "=0.20.0", default-features = false, features = ["std", "positions"] }
+eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "wgpu_no_default_features", "accesskit"] }
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl"] }
+rfd = { version = "=0.17.2", default-features = false }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.154", features = ["float_roundtrip"] }
+cpal = { version = "=0.18.2", default-features = false }
+egui_extras = { version = "=0.36.2", default-features = false, features = ["svg", "image"] }
+base64 = { version = "=0.22.1" }
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png"] }
+sha2 = { version = "=0.11.1", default-features = false }
+flacenc = { version = "=0.5.1", default-features = false }
+encoding_rs = { version = "=0.8.35" }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+safe_arch = { version = "=1.2.0", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+clipboard-win = { version = "=5.4.3" }
+wgpu = { version = "=30.0.1", default-features = false, features = ["dx12"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "=30.0.1", default-features = false, features = ["metal"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "=0.36.2", default-features = false, features = ["x11", "wayland"] }
+wgpu = { version = "=30.0.1", default-features = false, features = ["vulkan", "gles"] }
+rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal", "wayland"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
