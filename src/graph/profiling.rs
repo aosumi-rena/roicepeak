@@ -1,5 +1,4 @@
 //! Optional operator wall-time accounting on the inference control thread.
-//! This records no tensor values and does not alter graph evaluation order.
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -48,10 +47,7 @@ thread_local! {
     static ACTIVE: RefCell<Option<Collector>> = const { RefCell::new(None) };
 }
 
-/// A nested capture is isolated and restores the surrounding capture on exit.
-/// Panics also restore the previous collector; no timing state survives a job.
-/// An unwinding capture discards its partial timings. Spans cannot recover the
-/// final remaining budget during a panic; budget deltas cover ordinary Results.
+/// Restore the surrounding collector on return or panic.
 pub fn capture<T>(run: impl FnOnce() -> T) -> (T, Vec<OperatorTiming>) {
     struct Restore {
         previous: Option<Collector>,

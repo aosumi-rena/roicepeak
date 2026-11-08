@@ -3,7 +3,6 @@ use crate::app::{
     editor::EditorApp,
     i18n,
     native_menu::{self, Item},
-    sentence_edit::Fragment,
     shortcuts::Command,
     transport::Transport,
 };
@@ -29,8 +28,7 @@ fn capture_id() -> egui::Id {
     id().with("capture")
 }
 
-/// Capture before TextEdit: its pointer selector treats secondary presses as
-/// ordinary presses and would otherwise collapse the existing selected range.
+/// Preserve the selected range before handling a context click.
 pub(crate) fn capture(
     ui: &egui::Ui,
     block: &crate::app::document::Block,
@@ -53,8 +51,7 @@ pub(crate) fn capture(
     let mut range = egui::TextEdit::load_state(ui.ctx(), editor)
         .and_then(|state| state.cursor.char_range())
         .unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(0)));
-    // New/Open can reuse a block ID before TextEdit has clamped its old state.
-    // Change indices only, retaining orientation and each cursor's row affinity.
+    // Clamp reused indices without changing cursor orientation.
     let limit = egui::text::CCursor::new(block.text.chars().count()).index;
     range.primary.index = range.primary.index.min(limit);
     range.secondary.index = range.secondary.index.min(limit);
@@ -97,8 +94,7 @@ enum Action {
 
 impl EditorApp {
     pub(crate) fn open_script_context(&mut self, ctx: &egui::Context, capture: Capture) {
-        // TextEdit may already have processed this secondary press. Put the
-        // captured range back without triggering an authored edit or caret seek.
+        // Restore the selection without creating an edit or seeking.
         let editor = egui::Id::new(("block-text", capture.block));
         let mut state = egui::TextEdit::load_state(ctx, editor).unwrap_or_default();
         state.cursor.set_char_range(Some(capture.range));
@@ -236,25 +232,18 @@ impl EditorApp {
                 } else {
                     None
                 };
-                let fragments = if let Some(payload) = payload {
-                    payload.sentences
+                let caret = if let Some(payload) = payload {
+                    let caret = selection.start + payload.text().chars().count();
+                    self.replace_script_rich_text(ctx, index, selection, &payload.sentences)?;
+                    caret
                 } else {
                     let Some(text) = read_plain_clipboard()?.filter(|text| !text.is_empty()) else {
                         return Ok(());
                     };
-                    vec![Fragment {
-                        text,
-                        completes_sentence: false,
-                        words: Vec::new(),
-                        ssml: None,
-                    }]
+                    let caret = selection.start + text.chars().count();
+                    self.replace_script_text(ctx, index, selection, &text)?;
+                    caret
                 };
-                let caret = selection.start
-                    + fragments
-                        .iter()
-                        .map(|fragment| fragment.text.chars().count())
-                        .sum::<usize>();
-                self.replace_script_text(ctx, index, selection, &fragments)?;
                 self.script_caret(ctx, index, caret);
                 Ok(())
             }
@@ -262,7 +251,7 @@ impl EditorApp {
                 if selection.is_empty() {
                     Ok(())
                 } else {
-                    self.replace_script_text(ctx, index, selection, &[])
+                    self.replace_script_text(ctx, index, selection, "")
                 }
             }
             Action::SelectAll => {
@@ -277,8 +266,7 @@ impl EditorApp {
                 Ok(())
             }
             Action::Register => {
-                // Preparation may have refreshed canonical words while this
-                // menu was open. Build the draft from the accepted current tree.
+                // Build the draft from the latest prepared words.
                 if let Some(entry) = registration::entry(&self.project.blocks[index], selection)? {
                     self.begin_dictionary_window();
                     self.dictionary = true;

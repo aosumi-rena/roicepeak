@@ -33,10 +33,7 @@ fn neutral(text: &str, range: Range<usize>, output: &mut Vec<Annotation>) {
     }
 }
 
-/// Project an old block into one edited block or both Return halves. The explicit
-/// edit range is in ORIGINAL Unicode scalars; None derives one conservative edit
-/// interval by common prefix/suffix. Only annotations intersecting changed text or
-/// a new sentence boundary are removed; unaffected ranges are preserved exactly.
+/// Preserve annotations outside the edited Unicode-scalar range.
 pub(crate) fn project(
     before: &Block,
     targets: &mut [&mut Block],
@@ -171,6 +168,7 @@ pub(crate) fn slice(pending: &Pending, selection: Range<usize>) -> Result<Option
         native_owner: None,
         id: 1,
         text: block.text.clone(),
+        has_eos: true,
         words: Vec::new(),
         word_positions: Default::default(),
         query: Default::default(),
@@ -192,8 +190,7 @@ pub(crate) fn slice(pending: &Pending, selection: Range<usize>) -> Result<Option
     Ok(block.sentences.into_iter().next().and_then(|s| s.ssml))
 }
 
-/// Incoming starts are UTF-8 offsets in the new block. Pending fragment annotations
-/// already use offsets local to their fragment source; never use display-chunk offsets.
+/// Keep incoming fragment offsets local to their own UTF-8 text.
 pub(crate) fn overlay(block: &mut Block, incoming: &[(usize, &Pending)]) -> Result<(), String> {
     let mut preserved = Vec::new();
     let mut offset = 0;

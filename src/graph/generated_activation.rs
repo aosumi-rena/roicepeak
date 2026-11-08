@@ -19,7 +19,7 @@ pub struct GeneratedActivation {
 }
 
 impl GeneratedActivation {
-    pub(super) fn new(kind: Kind) -> Result<Self> {
+    pub(crate) fn new(kind: Kind) -> Result<Self> {
         #[cfg(target_arch = "x86_64")]
         {
             Ok(Self {
@@ -67,7 +67,7 @@ impl GeneratedActivation {
 
 impl GeneratedActivation {
     /// Caller budgets a complete activation pass before allocating workspaces.
-    pub(super) fn apply_in_place(&self, values: &mut [f32]) -> Result<()> {
+    pub(crate) fn apply_in_place(&self, values: &mut [f32]) -> Result<()> {
         #[cfg(target_arch = "x86_64")]
         {
             let kind = match self.kind {

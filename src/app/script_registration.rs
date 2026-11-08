@@ -32,7 +32,6 @@ pub(crate) fn entry(block: &Block, selection: Range<usize>) -> Result<Option<Ent
             return Err("Selected dictionary reading exceeds its limit".into());
         }
     }
-    // Native51F344 initializes accentType0 and51F5B1 copies that unchanged;
-    // selected codes are overwriteAccents, not an inferred accent-type number.
+    // Selected accents remain explicit overrides.
     Ok(Some(entry))
 }

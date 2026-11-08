@@ -52,6 +52,7 @@ impl DurationState {
 pub struct PhoneState {
     pub symbol: String,
     pub nucleus: bool,
+    pub stored_nucleus: bool,
     pub duration: DurationState,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -77,6 +78,7 @@ pub struct SentenceState {
     #[serde(deserialize_with = "crate::app::native_origin::required_owner")]
     pub(crate) native_owner: Option<crate::app::native_origin::NativeOwner>,
     pub text: String,
+    pub has_eos: bool,
     pub words: Vec<WordState>,
     pub word_positions: crate::app::sentence_edit::WordPositions,
     pub query: WordQueryState,
@@ -92,6 +94,21 @@ pub struct WordQueryState {
     pub controlled: Vec<WordState>,
 }
 impl WordQueryState {
+    pub(crate) fn boundary_only(&self) -> bool {
+        self.snapshots().iter().all(|words| {
+            words.len() == 2
+                && words.iter().zip([0x2000, 0x2001]).all(|(word, pos)| {
+                    word.pos == pos
+                        && word.language == 1
+                        && word.surface.is_empty()
+                        && word.morae.len() == 1
+                        && word.morae[0].reading.is_empty()
+                        && word.morae[0].phones.len() == 1
+                        && word.morae[0].phones[0].symbol == "sil"
+                })
+        })
+    }
+
     pub fn matches(&self, text: &str, words: &[WordState]) -> bool {
         self.text == text
             && self.controlled.len() == words.len()
@@ -157,6 +174,9 @@ impl WordState {
         }
         self.morae = Self::from_token(token, &vec![true; token.syllables.len()]).morae;
         for (index, mora) in self.morae.iter_mut().enumerate() {
+            for phone in &mut mora.phones {
+                phone.stored_nucleus = false;
+            }
             mora.code = if self.language == 1 {
                 if index == 0 {
                     roicepeak::phonemes::LOW
@@ -192,6 +212,7 @@ impl WordState {
                         .map(|p| PhoneState {
                             symbol: p.symbol.clone(),
                             nucleus: p.nucleus,
+                            stored_nucleus: p.nucleus,
                             duration: DurationState::default(),
                         })
                         .collect(),

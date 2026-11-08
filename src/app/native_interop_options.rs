@@ -22,14 +22,12 @@ pub(super) fn decode(value: &Value) -> Result<Settings, String> {
         }
         .boolean()
     };
-    let split = match int("mode")? {
-        0 => false,
-        1 => true,
-        _ => {
-            return Err(
-                "Native explicit-block export mode has no stored project export equivalent".into(),
-            );
-        }
+    let name_rule = boolean("name-rule")?;
+    let (split, selected_export) = match int("mode")? {
+        0 => (false, false),
+        1 => (true, false),
+        2 => (name_rule, true),
+        _ => return Err("Unsupported native export mode".into()),
     };
     let format = match int("audio-format")? {
         0 => Format::Wav,
@@ -46,7 +44,6 @@ pub(super) fn decode(value: &Value) -> Result<Settings, String> {
         1 => Encoding::ShiftJis,
         _ => return Err("Unsupported native character code".into()),
     };
-    boolean("name-rule")?;
     let raw = Field {
         value: get(object, "name-formats", path)?,
         path,
@@ -70,6 +67,8 @@ pub(super) fn decode(value: &Value) -> Result<Settings, String> {
         rate,
         encoding,
         split,
+        selected_export,
+        name_rule,
         parts,
         scripts: boolean("write-scripts")?,
         text: boolean("write-text")?,
@@ -89,8 +88,15 @@ pub(super) fn overlay(source: &Value, settings: &Settings) -> Result<Value, Stri
         .ok_or("Native export is not an object")?;
     object.insert(
         "mode".into(),
-        Value::from(if settings.split { 1 } else { 0 }),
+        Value::from(if settings.selected_export {
+            2
+        } else if settings.split {
+            1
+        } else {
+            0
+        }),
     );
+    object.insert("name-rule".into(), settings.name_rule.into());
     object.insert(
         "audio-format".into(),
         match settings.format {
@@ -134,6 +140,5 @@ pub(super) fn overlay(source: &Value, settings: &Settings) -> Result<Value, Stri
                 .collect(),
         ),
     );
-    // name-rule is a separate native option; Save-as name is not a native field.
     Ok(value)
 }

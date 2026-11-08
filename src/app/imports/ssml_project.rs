@@ -39,12 +39,14 @@ pub(super) fn replacement(
         project.blocks.push(block);
     }
     project.validate()?;
-    if serde_json::to_vec(&project)
-        .map_err(|e| e.to_string())?
-        .len()
+    if project
+        .blocks
+        .iter()
+        .map(|block| block.text.len())
+        .sum::<usize>()
         > MAX_BYTES
     {
-        return Err("Imported project would exceed 16 MiB".into());
+        return Err("Imported text exceeds 16 MiB".into());
     }
     Ok(project)
 }

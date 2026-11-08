@@ -4,7 +4,7 @@ use crate::app::{document::Project, style};
 use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
     Accent,
     Intonation,
@@ -36,6 +36,7 @@ pub struct EditorApp {
     pub portrait_state: crate::app::portrait::State,
     pub avatar_cache: std::collections::BTreeMap<String, std::sync::Arc<[u8]>>,
     pub resources: crate::app::resources::Locations,
+    pub(crate) settings_state: crate::app::settings::State,
     pub resource_settings: bool,
     pub resource_draft: Option<crate::app::resources::Locations>,
     pub transport: crate::app::transport::Transport,
@@ -71,6 +72,7 @@ pub struct EditorApp {
     pub history_navigation: bool,
     pub pending: Option<PendingAction>,
     pub(crate) native_save: Option<crate::app::native_save::Pending>,
+    pub(crate) save_worker: crate::app::save_worker::Worker,
     pub quit_approved: bool,
     pub player: crate::app::audio::Player,
     pub rendered_audio: std::sync::Arc<Vec<f32>>,
@@ -93,7 +95,10 @@ pub struct EditorApp {
     pub rendered_blocks: std::collections::BTreeMap<u64, (f64, f64)>,
 }
 impl EditorApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        locations: Result<crate::app::resources::Locations, String>,
+    ) -> Self {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.clear();
         fonts.font_data.insert(
@@ -128,6 +133,7 @@ impl EditorApp {
             avatar_cache: Default::default(),
             portrait_state: Default::default(),
             resources: crate::app::resources::Locations::default(),
+            settings_state: Default::default(),
             resource_settings: false,
             resource_draft: None,
             transport: crate::app::transport::Transport::Stopped,
@@ -163,6 +169,7 @@ impl EditorApp {
             history_navigation: false,
             pending: None,
             native_save: None,
+            save_worker: crate::app::save_worker::Worker::default(),
             quit_approved: false,
             player: crate::app::audio::Player::default(),
             rendered_audio: std::sync::Arc::default(),
@@ -195,10 +202,11 @@ impl EditorApp {
             Ok(shortcuts) => editor.shortcuts = shortcuts,
             Err(error) => editor.error = Some(error),
         }
-        match crate::app::resources::Locations::load() {
+        match locations {
             Ok(locations) => {
                 editor.locale = locations.locale;
                 editor.resources = locations;
+                editor.restore_settings();
                 if let Err(error) = editor.reload_voices() {
                     editor.error = Some(error);
                 }
@@ -344,7 +352,7 @@ impl eframe::App for EditorApp {
         crate::app::inspector_scroll::raw_input(ctx, input);
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.history_navigation = false;
         self.history_selection = None;
         let context = ui.ctx().clone();
@@ -382,6 +390,7 @@ impl eframe::App for EditorApp {
                 self.pending = Some(PendingAction::Quit);
             }
         }
+        self.project_drop(&context);
         self.dispatch_shortcuts(&context);
         self.isolate_alert_focus(&context);
         let tooltip_scope = crate::app::root_tooltip::Scope::new(&context);
@@ -543,5 +552,14 @@ impl eframe::App for EditorApp {
                 .unwrap_or_default(),
             if self.dirty { " *" } else { "" }
         )));
+        let visible = frame
+            .winit_window()
+            .and_then(|window| window.is_visible())
+            .unwrap_or(true);
+        self.synchronize_settings(&context, visible);
+    }
+
+    fn on_exit(&mut self) {
+        self.flush_settings();
     }
 }

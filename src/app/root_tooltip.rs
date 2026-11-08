@@ -49,7 +49,6 @@ pub(crate) fn attach(response: Response, text: &str) -> Response {
     if response.ctx.viewport_id() != egui::ViewportId::ROOT || !main_content {
         return response.on_hover_text(text);
     }
-    // Hover scheduling remains with egui until the reference timer is qualified.
     if !text.is_empty()
         && response.enabled()
         && egui::Tooltip::should_show_tooltip(&response, false)
@@ -148,7 +147,9 @@ pub(crate) fn paint(ui: &mut egui::Ui, root: Rect, enabled: bool) {
     let mut tooltip = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(root));
     tooltip.set_clip_rect(root);
     egui::Image::from_bytes(image.uri, image.bytes).paint_at(&tooltip, bounds);
-    tooltip
-        .painter()
-        .galley(body.center() - galley.size() * 0.5, galley, color);
+    tooltip.painter().galley(
+        body.center() - galley.rect.center().to_vec2(),
+        galley,
+        color,
+    );
 }

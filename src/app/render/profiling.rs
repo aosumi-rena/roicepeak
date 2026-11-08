@@ -5,7 +5,6 @@ use roicepeak::{
     synthesis::{PreparedQuery, Render},
 };
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs,
@@ -123,7 +122,6 @@ pub struct RenderProfile {
     pub blocks: usize,
     pub text_characters: usize,
     pub text_bytes: usize,
-    pub request_sha256: String,
     pub narrators: Vec<String>,
     pub narrators_truncated: bool,
     pub output_samples: usize,
@@ -165,11 +163,6 @@ impl RenderProfile {
                 block.narrator.to_string()
             })
             .collect();
-        // Hash the complete project snapshot so edits/repeated requests are
-        // distinguishable without persisting their text or dictionary entries.
-        let request_sha256 = serde_json::to_vec(&request.project)
-            .map(|bytes| crate::app::hex::encode(&Sha256::digest(bytes)))
-            .unwrap_or_else(|_| "unavailable".into());
         Self {
             process_id: std::process::id(),
             status: "submitted".into(),
@@ -177,7 +170,6 @@ impl RenderProfile {
             blocks: request.project.blocks.len(),
             text_characters,
             text_bytes,
-            request_sha256,
             narrators_truncated: narrators.len() > 16
                 || narrators.iter().any(|key| key.chars().count() > 256),
             narrators: narrators
@@ -250,7 +242,6 @@ struct Event {
     job_kind: Option<String>,
     unix_ms: u64,
     status: String,
-    request_sha256: Option<String>,
     queue_seconds: Option<f64>,
     worker_seconds: Option<f64>,
     baseline_calls: Option<usize>,
@@ -276,8 +267,7 @@ impl Ledger {
     /// Install lifecycle state without serializing or touching the filesystem.
     pub(super) fn record_memory(&mut self, profile: &RenderProfile) {
         let mut profile = profile.clone();
-        // Lifecycle snapshots do not own device updates. Keep any timing that
-        // has already been attached, including a retained load after eviction.
+        // Keep device timing already attached to this generation.
         let attached_output = self
             .recent_renders
             .iter()
@@ -362,7 +352,6 @@ impl Ledger {
             job_kind: profile.map(|profile| profile.job_kind.clone()),
             unix_ms: now_ms(),
             status: status.into(),
-            request_sha256: profile.map(|profile| profile.request_sha256.clone()),
             queue_seconds: profile.map(|profile| profile.queue_seconds),
             worker_seconds: profile.map(|profile| profile.worker_seconds),
             baseline_calls: profile.map(|profile| profile.baseline_calls.attempted),
@@ -394,8 +383,7 @@ impl Ledger {
                 attached = true;
             }
         }
-        // Keep a bounded record even if an older render profile has been evicted;
-        // the explicit generation remains unambiguous and is never reassigned.
+        // Retain generation identity even after its render profile is evicted.
         if let Some(previous) = self
             .output_loads
             .iter_mut()
@@ -440,9 +428,7 @@ impl Ledger {
             } else if !self.events.is_empty() {
                 self.events.remove(0);
             } else {
-                // Large narrator labels and many operator shapes may make the
-                // latest reports exceed the cap even after history is gone.
-                // Retain the hottest rows and explicitly mark the truncation.
+                // Truncate the largest report rows to enforce the size cap.
                 let candidate = [
                     &mut self.latest,
                     &mut self.latest_render,
@@ -468,8 +454,7 @@ impl Ledger {
 }
 
 impl super::Worker {
-    /// Persist on the UI/control thread after polling Player; never from CPAL.
-    /// Returns whether the exact render generation is still in the bounded ledger.
+    /// Persist delivery updates on the control thread.
     pub fn record_output_timing(&self, timing: crate::app::audio::OutputTimings) -> bool {
         self.shared
             .diagnostics

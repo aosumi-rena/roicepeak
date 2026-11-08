@@ -66,6 +66,10 @@ impl ForwardFloat {
         (self.inputs, self.outputs)
     }
 
+    pub(super) fn kernel(&self) -> usize {
+        self.kernel
+    }
+
     pub(super) fn estimated_bytes(&self) -> usize {
         crate::memory::values(&self.coefficients)
     }
@@ -99,6 +103,61 @@ impl ForwardFloat {
         } else {
             (padded - span) / step + 1
         };
+        self.run_range(
+            input.values(),
+            0,
+            input.rows(),
+            0,
+            frames,
+            step,
+            padding,
+            dilation,
+            bias,
+            budget,
+        )
+    }
+
+    pub(super) fn run_range(
+        &self,
+        input: &[f32],
+        origin: usize,
+        received: usize,
+        first_output: usize,
+        frames: usize,
+        step: usize,
+        padding: usize,
+        dilation: usize,
+        bias: Option<&[f32]>,
+        budget: &mut Budget,
+    ) -> Result<Tensor> {
+        if input.len() % self.inputs != 0
+            || origin > received
+            || input.len() / self.inputs > received - origin
+            || step == 0
+            || dilation == 0
+            || bias.is_some_and(|values| values.len() != self.outputs)
+        {
+            return Err(invalid("float convolution input dimensions differ"));
+        }
+        let span = (self.kernel - 1)
+            .checked_mul(dilation)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| invalid("convolution span overflow"))?;
+        let padded = padding
+            .checked_mul(2)
+            .and_then(|n| received.checked_add(n))
+            .ok_or_else(|| invalid("convolution padding overflow"))?;
+        let total_frames = if padded < span {
+            0
+        } else {
+            (padded - span) / step + 1
+        };
+        if first_output
+            .checked_add(frames)
+            .is_none_or(|n| n > total_frames)
+        {
+            return Err(invalid("float convolution output range"));
+        }
         let output_elements = checked_elements(frames, self.outputs)?;
         let macs_per_row = self.coefficients.len();
         let macs = frames
@@ -118,15 +177,21 @@ impl ForwardFloat {
         plan.execute(output.values_mut(), self.outputs, |first, target| {
             let mut queued = vec![0.0; workspace_elements];
             for (offset, row) in target.chunks_exact_mut(self.outputs).enumerate() {
-                let time = first + offset;
+                let time = first_output + first + offset;
                 for tap in 0..self.kernel {
                     let at = time
                         .checked_mul(step)
                         .and_then(|n| tap.checked_mul(dilation).and_then(|k| n.checked_add(k)))
                         .ok_or_else(|| invalid("float convolution input index overflow"))?;
                     let slice = &mut queued[tap * self.inputs..(tap + 1) * self.inputs];
-                    if let Some(source) = at.checked_sub(padding).filter(|n| *n < input.rows()) {
-                        slice.copy_from_slice(input.row(source));
+                    if let Some(source) = at.checked_sub(padding).filter(|n| *n < received) {
+                        let local = source
+                            .checked_sub(origin)
+                            .filter(|n| *n < input.len() / self.inputs)
+                            .ok_or_else(|| invalid("float convolution retained input range"))?;
+                        slice.copy_from_slice(
+                            &input[local * self.inputs..(local + 1) * self.inputs],
+                        );
                     } else {
                         slice.fill(0.0);
                     }

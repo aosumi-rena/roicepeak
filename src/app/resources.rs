@@ -3,13 +3,15 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Locations {
+    #[serde(default)]
+    pub editor: crate::app::settings::Preferences,
     #[serde(default)]
     pub locale: crate::app::i18n::Locale,
     pub voice_roots: Vec<PathBuf>,
@@ -34,6 +36,7 @@ fn portrait_visible() -> bool {
 impl Default for Locations {
     fn default() -> Self {
         Self {
+            editor: crate::app::settings::Preferences::default(),
             locale: crate::app::i18n::Locale::default(),
             voice_roots: Vec::new(),
             dictionary: None,
@@ -59,6 +62,7 @@ impl Locations {
         }
     }
     pub fn validate(&self) -> Result<(), String> {
+        self.editor.validate()?;
         if self
             .expanded_corrections
             .iter()
@@ -150,6 +154,23 @@ impl Locations {
         if bytes.len() > 65_536 {
             return Err("ROICEPEAK resource locations exceed 64 KiB".into());
         }
-        fs::write(path, bytes).map_err(|e| e.to_string())
+        let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let mut created = false;
+        let result = (|| {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|error| error.to_string())?;
+            created = true;
+            file.write_all(&bytes).map_err(|error| error.to_string())?;
+            file.sync_all().map_err(|error| error.to_string())?;
+            drop(file);
+            fs::rename(&temporary, &path).map_err(|error| error.to_string())
+        })();
+        if result.is_err() && created {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
 }

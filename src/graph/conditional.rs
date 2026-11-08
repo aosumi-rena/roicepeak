@@ -1,7 +1,11 @@
-use super::{Budget, Graph, add, children, payload};
+use super::{
+    Budget, Graph, add, children,
+    generated_activation::{GeneratedActivation, Kind},
+    payload,
+};
+pub(crate) mod streaming;
 use crate::{
     Result,
-    activation::sigmoid,
     dnni::Node,
     invalid,
     tensor::{Tensor, u32_at},
@@ -14,6 +18,8 @@ pub struct Gated {
     condition: usize,
     main: Box<Graph>,
     projection: Option<Box<Graph>>,
+    tanh: GeneratedActivation,
+    sigmoid: GeneratedActivation,
 }
 impl Gated {
     pub fn estimated_bytes(&self) -> usize {
@@ -51,6 +57,8 @@ impl Gated {
             condition,
             main,
             projection,
+            tanh: GeneratedActivation::new(Kind::Tanh)?,
+            sigmoid: GeneratedActivation::new(Kind::Sigmoid)?,
         })
     }
     pub(super) fn run(
@@ -70,18 +78,30 @@ impl Gated {
             }
             projection = add(&projection, &layer.run_with(c, budget)?, budget)?;
         }
+        self.activate(&projection, budget)
+    }
+
+    fn activate(&self, projection: &Tensor, budget: &mut Budget) -> Result<Tensor> {
         budget.spend(
             projection
                 .rows()
                 .saturating_mul(self.outputs)
-                .saturating_mul(32),
-            projection.rows().saturating_mul(self.outputs),
+                .saturating_mul(65),
+            projection
+                .rows()
+                .saturating_mul(self.outputs)
+                .saturating_add(self.outputs),
         )?;
         let mut y = Tensor::zeros(projection.rows(), self.outputs)?;
+        let mut gates = vec![0.0; self.outputs];
         for t in 0..y.rows() {
-            for c in 0..self.outputs {
-                y.row_mut(t)[c] =
-                    projection.row(t)[c].tanh() * sigmoid(projection.row(t)[self.outputs + c]);
+            y.row_mut(t)
+                .copy_from_slice(&projection.row(t)[..self.outputs]);
+            gates.copy_from_slice(&projection.row(t)[self.outputs..]);
+            self.tanh.apply_in_place(y.row_mut(t))?;
+            self.sigmoid.apply_in_place(&mut gates)?;
+            for (value, gate) in y.row_mut(t).iter_mut().zip(&gates) {
+                *value *= *gate;
             }
         }
         Ok(y)

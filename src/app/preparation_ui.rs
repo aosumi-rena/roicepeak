@@ -4,9 +4,6 @@ use eframe::egui;
 
 impl EditorApp {
     pub(crate) fn prepare_project(&mut self) {
-        if self.native_save.is_some() {
-            return;
-        }
         let Some(config) = self.render_config.clone() else {
             return;
         };
@@ -14,12 +11,11 @@ impl EditorApp {
             .project
             .blocks
             .iter()
-            .any(|block| !block.text.trim().is_empty())
+            .any(|block| block.has_synthesis_units())
         {
             return;
         }
-        // Editing may temporarily produce invalid dictionary/readings. Keep such
-        // errors out of modal dialogs; explicit Play still reports the failure.
+        // Defer transient editing errors until explicit playback.
         let user_dictionary = match self.dictionary_snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -43,10 +39,6 @@ impl EditorApp {
         let Some(result) = self.render_worker.poll_prepare() else {
             return;
         };
-        if self.save_preparation_pending() {
-            self.accept_save_preparation(result, ctx);
-            return;
-        }
         let result = match result {
             Ok(result)
                 if result.source.same_content(&self.project)
@@ -71,8 +63,7 @@ impl EditorApp {
                 if let Err(error) = self.export.remember_preparation(result) {
                     self.render_status = error;
                 }
-                // Derived metadata is applied before the frame's history snapshot;
-                // it cannot cancel synthesis or create a synthetic user edit.
+                // Apply derived metadata before recording history.
                 self.dirty |= self.project != updated;
                 self.project = updated;
                 self.query_basis_current = true;

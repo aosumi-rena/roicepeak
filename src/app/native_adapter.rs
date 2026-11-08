@@ -276,6 +276,9 @@ pub(crate) fn overlay_sentence(
     if draft.state().text != sentence.text {
         retained_text::overlay(&mut value, sentence)?;
     }
+    if draft.state().has_eos != sentence.has_eos {
+        value["has-eos"] = Value::Bool(sentence.has_eos);
+    }
     Ok(value)
 }
 

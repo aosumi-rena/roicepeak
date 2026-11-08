@@ -2,6 +2,10 @@
 use super::{Block, Project, SentenceState, WordState, alignment, state};
 use crate::app::sentences::{self, SentenceRef};
 impl Block {
+    pub(crate) fn has_synthesis_units(&self) -> bool {
+        !self.sentences.is_empty() || !self.text.is_empty()
+    }
+
     pub fn resolved_sentences(&self) -> Result<Vec<SentenceState>, String> {
         let mut copy = Block::new(self.id);
         copy.text = self.text.clone();
@@ -21,6 +25,10 @@ impl Block {
         {
             return Ok(());
         }
+        self.sync_partition()
+    }
+
+    pub(crate) fn sync_partition(&mut self) -> Result<(), String> {
         let pending_before = self.sentences.iter().any(|s| s.ssml.is_some()).then(|| {
             let mut old = self.clone();
             old.text = old.sentences.iter().map(|s| s.text.as_str()).collect();
@@ -54,6 +62,7 @@ impl Block {
                     native_owner: None,
                     id: serial,
                     text: String::new(),
+                    has_eos: true,
                     words: Vec::new(),
                     word_positions: Default::default(),
                     query: Default::default(),
@@ -178,6 +187,7 @@ impl Block {
                     native_owner: None,
                     id: right.sentence_serial,
                     text: tail,
+                    has_eos: true,
                     words: left.words.clone(),
                     word_positions: left.word_positions.clone(),
                     query: left.query.clone(),
@@ -257,8 +267,7 @@ impl Block {
         let mut phones = [0usize; 5];
         for sentence in &self.sentences {
             sentence.word_positions.validate(&sentence.words)?;
-            if sentence.text.is_empty()
-                || sentence.id == 0
+            if sentence.id == 0
                 || sentence.id > self.sentence_serial
                 || !ids.insert(sentence.id)
                 || sentence.words.len() > 4096
@@ -276,7 +285,9 @@ impl Block {
                 pending.validate(&sentence.text)?;
             }
             let snapshots = sentence.query.snapshots();
-            if (sentence.query.text.is_empty() && snapshots.iter().any(|words| !words.is_empty()))
+            if (sentence.query.text.is_empty()
+                && snapshots.iter().any(|words| !words.is_empty())
+                && !sentence.query.boundary_only())
                 || snapshots
                     .iter()
                     .any(|words| words.len() != sentence.query.raw.len())

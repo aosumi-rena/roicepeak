@@ -1,7 +1,9 @@
 //! Plain voice resource catalog.
 mod artwork;
 mod identity;
+mod inheritance;
 mod metadata;
+mod style_rows;
 pub use artwork::PortraitSources;
 pub use identity::{EmotionControl, EmotionMetadata, IdentityMetadata};
 mod resolve;
@@ -71,6 +73,7 @@ struct Loader {
     identities: BTreeSet<String>,
     metadata_bytes: usize,
     artwork_bytes: usize,
+    records: Vec<inheritance::Record>,
 }
 impl Loader {
     fn voice(&mut self, root: &resolve::Root, path: PathBuf) -> Result<(), String> {
@@ -112,40 +115,73 @@ impl Loader {
         if self.metadata_bytes > 64 * 1024 * 1024 {
             return Err("Voice catalog metadata limit".into());
         }
-        match metadata::load(root, &path, bytes) {
-            Ok(mut voice) => {
-                if self.identities.insert(voice.key.clone()) {
-                    let artwork = voice.avatar.as_ref().map_or(0, Vec::len)
-                        + voice
-                            .portrait_main
-                            .as_ref()
-                            .map_or(0, |portrait| portrait.bytes.len());
-                    if self.artwork_bytes.saturating_add(artwork) > 64 * 1024 * 1024 {
-                        voice.avatar = None;
-                        voice.portrait_main = None;
-                        self.catalog.problems.push(format!(
-                            "{}: optional artwork exceeds the catalog's 64 MiB artwork budget",
-                            path.display()
-                        ));
-                    } else {
-                        self.artwork_bytes += artwork;
-                    }
-                    self.catalog.voices.push(voice);
-                } else {
-                    self.catalog.problems.push(format!("{}: narrator identity {:?} is already supplied by an earlier configured source; keeping that source", path.display(), voice.key));
-                }
-            }
+        match inheritance::Record::new(root.directory.clone(), path.clone(), bytes) {
+            Ok(record) => self.records.push(record),
             Err(error) => self
                 .catalog
                 .problems
                 .push(format!("{}: {error}", path.display())),
         }
-        self.catalog.problems.extend(
-            root.take_problems()
-                .into_iter()
-                .map(|problem| format!("{}: {problem}", path.display())),
-        );
         Ok(())
+    }
+
+    fn resolve(&mut self) {
+        let resolver = inheritance::Resolver::new(&self.records);
+        for (index, record) in self.records.iter().enumerate() {
+            let root = resolve::Root::plain(record.root.clone());
+            let path = &record.source;
+            let voice = resolver.resolve(index).and_then(|resolved| {
+                metadata::load(&root, path, Arc::clone(&record.bytes), resolved)
+            });
+            match voice {
+                Ok(mut voice) => {
+                    if self
+                        .catalog
+                        .voices
+                        .iter()
+                        .any(|previous| previous.key == voice.key && previous.name != voice.name)
+                    {
+                        use sha2::{Digest, Sha256};
+                        let mut hash = Sha256::new();
+                        for field in [&voice.key, &voice.name] {
+                            hash.update((field.len() as u32).to_le_bytes());
+                            hash.update(field.as_bytes());
+                        }
+                        hash.update(voice.version.to_le_bytes());
+                        voice.key = crate::app::hex::encode(&hash.finalize());
+                    }
+                    if self.identities.insert(voice.key.clone()) {
+                        let artwork = voice.avatar.as_ref().map_or(0, Vec::len)
+                            + voice
+                                .portrait_main
+                                .as_ref()
+                                .map_or(0, |portrait| portrait.bytes.len());
+                        if self.artwork_bytes.saturating_add(artwork) > 64 * 1024 * 1024 {
+                            voice.avatar = None;
+                            voice.portrait_main = None;
+                            self.catalog.problems.push(format!(
+                                "{}: optional artwork exceeds the catalog's 64 MiB artwork budget",
+                                path.display()
+                            ));
+                        } else {
+                            self.artwork_bytes += artwork;
+                        }
+                        self.catalog.voices.push(voice);
+                    } else {
+                        self.catalog.problems.push(format!("{}: narrator identity {:?} is already supplied by an earlier configured source; keeping that source", path.display(), voice.key));
+                    }
+                }
+                Err(error) => self
+                    .catalog
+                    .problems
+                    .push(format!("{}: {error}", path.display())),
+            }
+            self.catalog.problems.extend(
+                root.take_problems()
+                    .into_iter()
+                    .map(|problem| format!("{}: {problem}", path.display())),
+            );
+        }
     }
 
     fn plain(&mut self, root: PathBuf, voice: Option<PathBuf>) -> Result<(), String> {
@@ -191,11 +227,12 @@ impl Catalog {
         for source in discovered.candidates {
             loader.plain(source.root, source.voice)?;
         }
+        loader.resolve();
         if !roots.is_empty() && loader.catalog.voices.is_empty() {
-            loader.catalog.problems.push(
-                "Configured search paths contain no usable complete plain voice descriptions"
-                    .into(),
-            );
+            loader
+                .catalog
+                .problems
+                .push("Configured search paths contain no usable plain voice descriptions".into());
         }
         loader.catalog.rebuild_identities();
         Ok(loader.catalog)

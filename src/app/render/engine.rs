@@ -176,7 +176,7 @@ pub(super) fn perform(
     let mut prepared_units = Vec::new();
     for block in &request.project.blocks {
         checkpoint(shared, generation, kind)?;
-        if block.text.trim().is_empty() {
+        if !block.has_synthesis_units() {
             let position = planner.append(block, &[]).map_err(Error)?;
             blocks.push(RenderedBlock {
                 id: block.id,
@@ -216,8 +216,7 @@ pub(super) fn perform(
         let mut block_samples = 0usize;
         for sentence in &units {
             checkpoint(shared, generation, kind)?;
-            // Partition original text first. Normalization and token indices
-            // belong exclusively to this unit and never replace source ranges.
+            // Normalize within each unit without replacing its original text range.
             let original = &block.text[sentence.bytes.clone()];
             let mut spec = super::unit::Spec {
                 kind: if kind == JobKind::Playback {
@@ -260,15 +259,21 @@ pub(super) fn perform(
                         &corrections,
                         request.config.value_policy,
                     )?;
-                    let style_offset = voice.style.mix(&weights)?.intonation;
+                    let style_offset = voice.manifest.synth.stylebook().mix(&weights)?.intonation;
                     compiled = Some((voice, weights, style_offset));
                 }
                 let (voice, weights, style_offset) = compiled.as_ref().unwrap();
                 spec.weights = weights;
                 spec.style_offset = *style_offset;
-                super::unit::perform(cache, voice, &user_dictionary, spec, profile, || {
-                    checkpoint(shared, generation, kind)
-                })?
+                super::unit::perform(
+                    cache,
+                    voice,
+                    &user_dictionary,
+                    spec,
+                    profile,
+                    || checkpoint(shared, generation, kind),
+                    None,
+                )?
             };
             if let Some(progress) = progress.as_deref_mut() {
                 progress.complete(

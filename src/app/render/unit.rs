@@ -115,6 +115,7 @@ pub(super) fn perform(
     spec: Spec<'_>,
     profile: &mut RenderProfile,
     check: impl Fn() -> CoreResult<()>,
+    emit: Option<&mut dyn FnMut(&[f32]) -> CoreResult<()>>,
 ) -> CoreResult<Output> {
     check()?;
     let raw = preparation::analyze(
@@ -262,12 +263,22 @@ pub(super) fn perform(
     }
     profile.baseline_cache_misses += 1;
     let started = Instant::now();
-    let rendered = voice.manifest.synth.render_prepared_profiled(
-        &query,
-        &core_parameters,
-        &edits,
-        &mut super::engine::budget(),
-    );
+    let rendered = if let Some(emit) = emit {
+        voice.manifest.synth.render_prepared_profiled_streamed(
+            &query,
+            &core_parameters,
+            &edits,
+            &mut super::engine::budget(),
+            emit,
+        )
+    } else {
+        voice.manifest.synth.render_prepared_profiled(
+            &query,
+            &core_parameters,
+            &edits,
+            &mut super::engine::budget(),
+        )
+    };
     profile.core_call(authored, &rendered, started.elapsed());
     let mut base = unpack(
         rendered?,

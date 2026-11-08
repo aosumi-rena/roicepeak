@@ -40,8 +40,7 @@ impl Dictionary {
         if !charset[..end].eq_ignore_ascii_case(b"utf-8") {
             return Err(invalid("dictionary must declare UTF-8"));
         }
-        // Header lsize counts predecessor/right-context rows; rsize counts
-        // successor/left-context rows. Token lc therefore uses rsize.
+        // Token left-context IDs use successor columns.
         let right_ids = u32_at(&bytes, 16) as usize;
         let left_ids = u32_at(&bytes, 20) as usize;
         if left_ids == 0 || right_ids == 0 || left_ids > 65_535 || right_ids > 65_535 {

@@ -4,63 +4,11 @@ use crate::app::{
     document::{Block, Project, SentenceState},
     native_adapter,
     native_origin::{NativeOrigin, NativeOwner},
-    sentences,
 };
 use serde_json::Value;
 
-fn matches_partition(block: &Block) -> bool {
-    let partition = sentences::partition(&block.text);
-    partition.len() == block.sentences.len()
-        && partition
-            .iter()
-            .zip(&block.sentences)
-            .all(|(range, sentence)| {
-                block.text.get(range.bytes.clone()) == Some(sentence.text.as_str())
-            })
-}
-
 pub(super) fn requires_preparation(project: &Project) -> Result<bool, String> {
-    project.validate()?;
-    if project.blocks.iter().any(|block| {
-        block.text.trim().is_empty()
-            && block
-                .sentences
-                .iter()
-                .any(|sentence| sentence.ssml.is_some())
-    }) {
-        return Err(
-            "Pending pronunciation on whitespace-only text cannot be prepared for Native Save"
-                .into(),
-        );
-    }
-    for block in &project.blocks {
-        if block.text.trim().is_empty() {
-            continue;
-        }
-        if block.native_owner.is_none() || block.sentences.is_empty() {
-            return Ok(true);
-        }
-        for sentence in &block.sentences {
-            if sentence.ssml.is_some() {
-                return Ok(true);
-            }
-            if sentence.text.trim().is_empty() {
-                continue;
-            }
-            let (Some(origin), Some(owner)) =
-                (project.native_origin.as_ref(), sentence.native_owner)
-            else {
-                return Ok(true);
-            };
-            let original = origin.sentence(owner)?;
-            if original["text"].as_str() != Some(sentence.text.as_str())
-                || !native_adapter::preserves_pronunciation_input(original, sentence)?
-            {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+    crate::app::save_lexical::required(project)
 }
 
 fn sentence(origin: &NativeOrigin, current: &SentenceState) -> Result<Value, String> {
@@ -82,14 +30,12 @@ fn sentence(origin: &NativeOrigin, current: &SentenceState) -> Result<Value, Str
         if !current.text.trim().is_empty()
             && (changed_text || !native_adapter::preserves_pronunciation_input(original, current)?)
         {
-            // Validation uses the whole accepted query; the retained overlay
-            // still owns its original opaque word/mora/phone properties.
+            // Validate changed words before preserving their opaque properties.
             fresh::replacement_sentence(current)?;
         }
         return native_adapter::overlay_sentence(original, current);
     }
-    // The old token nodes are removed as a whole. No token subtree is guessed
-    // to belong to a different lexical or phonological sequence.
+    // Replace obsolete tokens as a whole.
     let replacement = fresh::replacement_sentence(current)?;
     let mut value = original.clone();
     for key in ["text", "has-eos", "tokens"] {
@@ -134,12 +80,6 @@ pub(super) fn overlay(
     } else {
         false
     };
-    if !unchanged && !matches_partition(block) {
-        return Err(
-            "Native Save requires ordinary sentence boundaries for changed structure or text"
-                .into(),
-        );
-    }
     if block.text.trim().is_empty()
         && block
             .segments
@@ -170,7 +110,8 @@ pub(super) fn overlay(
         None
     } else {
         Some(
-            sentences::partition(&block.text)
+            block
+                .sentence_ranges()
                 .iter()
                 .map(|range| {
                     let first = i32::try_from(range.chars.start)

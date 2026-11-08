@@ -1,5 +1,4 @@
 //! Independent output-row work; inner reductions remain entirely sequential.
-//! Uses a bounded persistent worker pool.
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use std::sync::OnceLock;
 

@@ -67,7 +67,10 @@ pub fn parse_srt(text: &str) -> Result<Captions, String> {
     srt::parse(text)
 }
 pub fn read_srt(path: &Path) -> Result<Captions, String> {
-    parse_srt(&text::decode(&read_bytes(path)?)?)
+    parse_srt(&read_text(path)?)
+}
+pub fn read_text(path: &Path) -> Result<String, String> {
+    text::decode(&read_bytes(path)?)
 }
 pub fn parse_csv(text: &str, catalog: &CsvCatalog) -> Result<Batch, String> {
     csv::parse(text, catalog)
@@ -135,9 +138,14 @@ pub fn append(
         ));
     }
     proposed.validate()?;
-    let bytes = serde_json::to_vec(&proposed).map_err(|e| e.to_string())?;
-    if bytes.len() > MAX_BYTES {
-        return Err("Imported project would exceed 16 MiB".into());
+    if proposed
+        .blocks
+        .iter()
+        .map(|block| block.text.len())
+        .sum::<usize>()
+        > MAX_BYTES
+    {
+        return Err("Imported text exceeds 16 MiB".into());
     }
     Ok((proposed, warnings))
 }

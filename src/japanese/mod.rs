@@ -1,5 +1,4 @@
 //! Japanese dictionary morphology to the explicit token inference interface.
-//! No installed files, user dictionaries or processes are discovered here.
 mod accent;
 mod kana;
 mod normalize;
@@ -46,6 +45,7 @@ struct Word {
     mod_value: i32,
     lexical_id: u64,
     fixed: bool,
+    authored_reading: bool,
 }
 
 impl Word {
@@ -68,6 +68,7 @@ impl Word {
             mod_value: 0,
             lexical_id: 0,
             fixed: false,
+            authored_reading: false,
         };
         word.set_reading(reading)?;
         Ok(word)
@@ -78,6 +79,9 @@ impl Word {
     }
 
     fn set_reading(&mut self, reading: &str) -> Result<()> {
+        if self.authored_reading {
+            return Ok(());
+        }
         self.morae = morae(reading)?;
         self.marks = vec![false; self.morae.len()];
         self.pronunciation = reading.into();
@@ -85,13 +89,14 @@ impl Word {
     }
 
     fn set_accent(&mut self, value: i32) {
+        if self.authored_reading {
+            return;
+        }
         self.marks = accent::pattern(self.morae.len(), value);
     }
 }
 
-/// Reads a dictionary CSV record, including quoted commas and escaped quotes.
-/// The bundled Japanese schema has seven fields; other schemas are explicit
-/// errors instead of guessed UniDic/IPADIC column positions.
+/// Parse the dictionary CSV schema with quoted-field support.
 fn fields(record: &str) -> Result<Vec<String>> {
     let mut result = Vec::new();
     let mut field = String::new();
@@ -136,7 +141,8 @@ fn word(morph: &Morph) -> Result<Word> {
         )));
     }
     let pause = punctuation(&f[0]);
-    let pron = if f.len() == 7 && f[2] != "*" && !f[2].is_empty() {
+    let has_pronunciation = f.len() == 7 && f[2] != "*" && !f[2].is_empty();
+    let pron = if has_pronunciation {
         &f[2]
     } else if pause {
         ""
@@ -148,9 +154,14 @@ fn word(morph: &Morph) -> Result<Word> {
             morph.surface
         )));
     };
-    let mut result = Word::new(&morph.surface, &f[0], &f[1], pron)?;
+    let mut result = match Word::new(&morph.surface, &f[0], &f[1], pron) {
+        Err(_) if morph.unknown && !has_pronunciation => {
+            Word::new(&morph.surface, &f[0], &f[1], "")?
+        }
+        result => result?,
+    };
     result.input_range = Some(morph.start..morph.end);
-    if result.morae.is_empty() && !pause {
+    if result.morae.is_empty() && !pause && !morph.unknown {
         return Err(invalid(format!("no spoken morae for {:?}", morph.surface)));
     }
     if f.len() == 7 {
@@ -161,6 +172,7 @@ fn word(morph: &Morph) -> Result<Word> {
             result.lexical_id = f[6]
                 .parse::<u64>()
                 .map_err(|_| invalid("Japanese dictionary lexical identifier is not u64"))?;
+            result.authored_reading = result.lexical_id == 1;
         }
     }
     Ok(result)
@@ -269,16 +281,12 @@ fn boundary(kind: u32) -> Token {
     }
 }
 
-/// Converts morphology from an already-normalized Japanese sentence into a
-/// complete BOS/EOS token tree. Unknown kana and ASCII letter names are spoken;
-/// unknown kanji, unsupported schemas/readings and missing pronunciations fail.
+/// Convert normalized morphology into a complete token tree.
 pub fn convert(morphs: &[Morph]) -> Result<Vec<Token>> {
     Ok(analyze(morphs)?.tokens)
 }
 
-/// Native accent-prediction eligibility accompanies the token tree. This is
-/// separate from `Token` so callers can preserve manual/dictionary accents
-/// without changing the explicit token interchange format.
+/// Preserve accent-prediction eligibility alongside tokens.
 pub struct Analysis {
     pub tokens: Vec<Token>,
     pub input_ranges: Vec<Option<std::ops::Range<usize>>>,

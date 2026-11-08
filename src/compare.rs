@@ -33,8 +33,7 @@ pub fn compare(a: &Tensor, b: &Tensor, absolute: f64, relative: f64) -> Result<C
     for (i, (&reference, &actual)) in a.values().iter().zip(b.values()).enumerate() {
         let delta = (actual as f64 - reference as f64).abs();
         let scale = (reference as f64).abs();
-        // Floor defines a finite descriptive relative metric near zero. The
-        // admission gate below always uses the unmodified reference magnitude.
+        // Use the reference magnitude for admission near zero.
         let rel = delta / scale.max(1e-30);
         if reference.to_bits() != actual.to_bits() {
             c.differing_words += 1;

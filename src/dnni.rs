@@ -5,7 +5,6 @@ use crate::{
     tensor::{Tensor, checked_elements, floats, u32_at},
 };
 
-// The supplied unified language model is 95,099,370 bytes.
 pub const MAX_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_NODES: usize = 100_000;
 pub const MAX_DEPTH: usize = 64;

@@ -1,4 +1,4 @@
-//! Explicit project formats and staged native file replacement.
+//! VOICEPEAK project I/O and staged file replacement.
 use crate::app::{
     document::Project, native_interop, native_project::NativeProject, render::Config,
 };
@@ -15,15 +15,14 @@ pub(crate) fn native(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("vpp"))
 }
 pub(crate) fn read(path: &Path, config: Option<&Config>) -> Result<Project, String> {
-    if native(path) {
-        native_interop::decode(NativeProject::read(path)?, config)
-    } else {
-        Project::read(path)
+    if !native(path) {
+        return Err("Select a VOICEPEAK project (*.vpp)".into());
     }
+    native_interop::decode(NativeProject::read(path)?, config)
 }
 pub(crate) fn write(path: &Path, project: &Project, config: Option<&Config>) -> Result<(), String> {
     if !native(path) {
-        return project.write(path);
+        return Err("Save as a VOICEPEAK project (*.vpp)".into());
     }
     let bytes = native_interop::encode(project, config)?;
     let name = path
@@ -31,7 +30,7 @@ pub(crate) fn write(path: &Path, project: &Project, config: Option<&Config>) -> 
         .ok_or("Project destination has no filename")?;
     let mut temporary = name.to_os_string();
     temporary.push(format!(
-        ".roicepeak-{}-{}.tmp",
+        ".{}-{}.tmp",
         std::process::id(),
         SERIAL.fetch_add(1, Ordering::Relaxed)
     ));

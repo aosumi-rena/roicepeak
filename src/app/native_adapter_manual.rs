@@ -15,7 +15,6 @@ pub(crate) struct NativeWordRanges {
 #[derive(Clone, Debug)]
 pub(crate) struct NativeSentenceDraft {
     state: SentenceState,
-    pub has_eos: bool,
     pub word_ranges: Vec<NativeWordRanges>,
     original: Value,
 }
@@ -191,6 +190,7 @@ pub(super) fn decode(value: &Value, id: u64, path: &str) -> Result<NativeSentenc
                     return Err(format!("{d_path}: negative authored duration"));
                 }
                 phones.push(PhoneState {
+                    stored_nucleus: raw_nucleus,
                     nucleus: if language == 1 {
                         roicepeak::japanese::is_nucleus(&symbol)
                     } else {
@@ -225,12 +225,12 @@ pub(super) fn decode(value: &Value, id: u64, path: &str) -> Result<NativeSentenc
             id,
             native_owner: None,
             text,
+            has_eos,
             words,
             word_positions: Default::default(),
             query: WordQueryState::default(),
             ssml: None,
         },
-        has_eos,
         word_ranges: ranges,
         original: value.clone(),
     })
@@ -241,7 +241,6 @@ impl NativeSentenceDraft {
         &self.state
     }
     /// Update authored values while keeping native ranges and opaque properties.
-    /// Structural/text edits require the separate origin-projection adapter.
     pub fn preserves_structure(&self, words: &[WordState]) -> Result<bool, String> {
         let source = &self.state.words;
         let boundary = |word: &WordState| matches!(word.pos, 0x2000 | 0x2001);
@@ -305,10 +304,7 @@ impl NativeSentenceDraft {
             }
             let syllables = target["syl"].as_array_mut().unwrap();
             for ((source, mora), target) in source.morae.iter().zip(&word.morae).zip(syllables) {
-                let authored_code = source.accent_edited
-                    || mora.accent_edited
-                    || source_word.pronunciation_edited != word.pronunciation_edited;
-                if authored_code && source.code != mora.code {
+                if source.code != mora.code {
                     target["a"] = mora.code.into();
                 }
                 if source.prediction_eligible != mora.prediction_eligible {
@@ -333,8 +329,9 @@ impl NativeSentenceDraft {
                     if source.duration.value.to_bits() != phone.duration.value.to_bits() {
                         target["d"] = Value::from(phone.duration.value);
                     }
-                    // Raw native n is preserved: derived Japanese query flags are
-                    // not authored changes to the serialized constructor state.
+                    if source.stored_nucleus != phone.stored_nucleus {
+                        target["n"] = phone.stored_nucleus.into();
+                    }
                 }
             }
         }

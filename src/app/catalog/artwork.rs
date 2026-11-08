@@ -50,8 +50,7 @@ impl PortraitSources {
             #[serde(default)]
             assets: BTreeMap<String, String>,
         }
-        // The bounded metadata snapshot is already shared with the binding.
-        // Do not retain duplicate encoded payloads for every emotion.
+        // Share encoded artwork across emotions.
         let description: Description =
             serde_json::from_slice(&self.metadata).map_err(|error| error.to_string())?;
         let root = resolve::Root::plain(self.directory.clone());

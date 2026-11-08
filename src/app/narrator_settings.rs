@@ -212,7 +212,7 @@ impl EditorApp {
                 Vec2::new(258.0, 26.0),
             );
             let mut display = value.percent();
-            let response = style::nonnegative(ui, index == 3, |ui| {
+            let response = style::nonnegative(ui, index == 0 || index == 3, |ui| {
                 style::parameter_row_padded(
                     ui,
                     (row.id(), "scalar", index),

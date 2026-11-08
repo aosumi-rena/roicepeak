@@ -180,8 +180,8 @@ impl ProgressBasis {
             Some(id) => self
                 .source_index
                 .get(&id)
-                .is_some_and(|index| self.source.blocks[*index].text.trim().is_empty()),
-            None => self.source.blocks.iter().all(|b| b.text.trim().is_empty()),
+                .is_some_and(|index| !self.source.blocks[*index].has_synthesis_units()),
+            None => self.source.blocks.iter().all(|b| !b.has_synthesis_units()),
         }
     }
 

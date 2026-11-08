@@ -609,7 +609,7 @@ fn execute(args: &[String]) -> Result<bool> {
                 output_elements: 128 * 1024 * 1024,
             };
             let y = if cmd == "embed-words" {
-                lm.encoder.encode(&words, &mut budget)?
+                lm.encoder().encode(&words, &mut budget)?
             } else {
                 lm.run(&words, &mut budget)?
             };

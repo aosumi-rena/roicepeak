@@ -225,7 +225,7 @@ impl EditorApp {
             let mixed = selected
                 .iter()
                 .any(|&index| !read(&self.project.blocks[index].parameters).same_number(current));
-            let response = style::nonnegative(ui, field == 3, |ui| {
+            let response = style::nonnegative(ui, field == 0 || field == 3, |ui| {
                 style::parameter_row_mixed(
                     ui,
                     ("setting", &selected_ids, field),

@@ -118,8 +118,7 @@ fn span(input: &[char]) -> Result<String> {
     Ok(result)
 }
 
-/// Expands numeric spans before dictionary lookup. Zero groups are omitted;
-/// this is a deliberate conventional spelling, not a claim of native parity.
+/// Expand numeric spans before dictionary lookup.
 pub fn expand(input: &str) -> Result<String> {
     if input.len() > 1_048_576 {
         return Err(invalid("Japanese number input byte budget"));
@@ -250,6 +249,22 @@ pub(super) fn adjust_counters(words: &mut [Word]) -> Result<()> {
         if w.detail != "数詞" {
             continue;
         }
+        // Preserve mora accents and prediction flags when contracting counters.
+        if !w.authored_reading
+            && !counter.authored_reading
+            && w.text.ends_with('百')
+            && w.pronunciation.ends_with('ク')
+            && counter.pos == "接尾辞"
+            && counter.detail == "名詞的"
+            && counter.text == "本"
+            && counter.pronunciation == "ポン"
+            && let Some(last) = w.morae.last_mut()
+            && last.as_str() == "ク"
+        {
+            w.pronunciation.pop();
+            w.pronunciation.push('ッ');
+            *last = "ッ".into();
+        }
         let Some(n) = numeral(&w.text) else {
             continue;
         };
@@ -310,7 +325,9 @@ pub(super) fn adjust_counters(words: &mut [Word]) -> Result<()> {
                 ][n],
             )?;
             w.set_accent(if [1, 6, 7, 8].contains(&n) { 2 } else { 1 });
-            counter.marks.fill(false);
+            if !counter.authored_reading {
+                counter.marks.fill(false);
+            }
             w.fixed = true;
             counter.fixed = true;
         } else if counter.text == "回" && n < 10 {
@@ -369,7 +386,9 @@ pub(super) fn adjust_counters(words: &mut [Word]) -> Result<()> {
             if pron != counter.pronunciation {
                 counter.set_reading(&pron)?;
             }
-            counter.marks.fill(false);
+            if !counter.authored_reading {
+                counter.marks.fill(false);
+            }
             w.fixed = true;
             counter.fixed = true;
         } else if matches!(counter.text.as_str(), "円" | "番") && n == 4 {

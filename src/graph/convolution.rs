@@ -13,6 +13,7 @@ use forward::ForwardFloat;
 #[path = "convolution/transpose.rs"]
 mod transpose;
 use transpose::Transpose;
+pub(super) mod streaming;
 
 #[derive(Debug)]
 enum Weights {
@@ -41,6 +42,38 @@ pub struct Convolution {
     transpose: bool,
 }
 impl Convolution {
+    pub(super) fn stream(&self) -> Result<streaming::Stream<'_>> {
+        streaming::Stream::new(self)
+    }
+
+    fn span(&self) -> Result<usize> {
+        let kernel = match &self.weights {
+            Weights::Packed(value) => value.kernel(),
+            Weights::Matrices(taps) => taps.len(),
+            Weights::Transposed(_) => {
+                return Err(invalid("transpose convolution streaming is unsupported"));
+            }
+        };
+        (kernel - 1)
+            .checked_mul(self.dilation)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| invalid("convolution span overflow"))
+    }
+
+    fn output_rows(&self, received: usize) -> Result<usize> {
+        let padded = self
+            .padding
+            .checked_mul(2)
+            .and_then(|n| received.checked_add(n))
+            .ok_or_else(|| invalid("convolution padding overflow"))?;
+        let span = self.span()?;
+        Ok(if padded < span {
+            0
+        } else {
+            (padded - span) / self.stride + 1
+        })
+    }
+
     pub fn estimated_bytes(&self) -> usize {
         crate::memory::sum([
             self.weights.estimated_bytes(),
@@ -169,20 +202,76 @@ impl Convolution {
             .saturating_mul(outputs)
             .saturating_mul(x.cols())
             .saturating_mul(taps.len());
-        self.run_quantized(taps, x, frames, macs, budget)
+        self.run_quantized(taps, x.values(), 0, x.rows(), 0, frames, macs, budget)
     }
+
+    fn run_range(
+        &self,
+        input: &[f32],
+        origin: usize,
+        received: usize,
+        first_output: usize,
+        frames: usize,
+        budget: &mut Budget,
+    ) -> Result<Tensor> {
+        let (inputs, outputs) = self.channels();
+        let total_frames = self.output_rows(received)?;
+        if inputs == 0
+            || input.len() % inputs != 0
+            || origin > received
+            || input.len() / inputs > received - origin
+            || first_output
+                .checked_add(frames)
+                .is_none_or(|n| n > total_frames)
+        {
+            return Err(invalid("convolution retained input or output range"));
+        }
+        match &self.weights {
+            Weights::Packed(value) => value.run_range(
+                input,
+                origin,
+                received,
+                first_output,
+                frames,
+                self.stride,
+                self.padding,
+                self.dilation,
+                self.bias.as_deref(),
+                budget,
+            ),
+            Weights::Matrices(taps) => self.run_quantized(
+                taps,
+                input,
+                origin,
+                received,
+                first_output,
+                frames,
+                frames
+                    .saturating_mul(outputs)
+                    .saturating_mul(inputs)
+                    .saturating_mul(taps.len()),
+                budget,
+            ),
+            Weights::Transposed(_) => {
+                Err(invalid("transpose convolution streaming is unsupported"))
+            }
+        }
+    }
+
     fn run_quantized(
         &self,
         taps: &[Matrix],
-        input: &Tensor,
+        input: &[f32],
+        origin: usize,
+        received: usize,
+        first_output: usize,
         frames: usize,
         macs: usize,
         budget: &mut Budget,
     ) -> Result<Tensor> {
         let outputs = taps[0].rows();
-        let macs_per_row = outputs
-            .saturating_mul(input.cols())
-            .saturating_mul(taps.len());
+        let inputs = taps[0].cols();
+        let macs_per_row = outputs.saturating_mul(inputs).saturating_mul(taps.len());
         let plan = super::parallel::FallibleRows::new(frames, macs_per_row);
         let scratch = if frames == 0 {
             0
@@ -190,24 +279,36 @@ impl Convolution {
             taps[0]
                 .workspace_elements()
                 .saturating_mul(plan.chunks())
-                .saturating_add(input.cols())
+                .saturating_add(inputs)
         };
         budget.spend(macs, frames.saturating_mul(outputs).saturating_add(scratch))?;
         let mut output = Tensor::zeros(frames, outputs)?;
         if frames == 0 {
             return Ok(output);
         }
-        let zero = vec![0.0; input.cols()];
+        let zero = vec![0.0; inputs];
         plan.execute(output.values_mut(), outputs, |first, target| {
             let mut workspace = Workspace::default();
             for (offset, row) in target.chunks_exact_mut(outputs).enumerate() {
-                let time = first + offset;
+                let time = first_output + first + offset;
                 for (index, tap) in taps.iter().enumerate() {
-                    let at = time * self.stride + index * self.dilation;
-                    let source = if at < self.padding || at - self.padding >= input.rows() {
+                    let at = time
+                        .checked_mul(self.stride)
+                        .and_then(|n| {
+                            index
+                                .checked_mul(self.dilation)
+                                .and_then(|k| n.checked_add(k))
+                        })
+                        .ok_or_else(|| invalid("convolution input index overflow"))?;
+                    let source = if at < self.padding || at - self.padding >= received {
                         zero.as_slice()
                     } else {
-                        input.row(at - self.padding)
+                        let local = (at - self.padding)
+                            .checked_sub(origin)
+                            .ok_or_else(|| invalid("convolution retained input range"))?;
+                        input
+                            .get(local * inputs..(local + 1) * inputs)
+                            .ok_or_else(|| invalid("convolution retained input range"))?
                     };
                     let mode = if index == 0 {
                         Accumulate::Replace

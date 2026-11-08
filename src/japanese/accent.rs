@@ -37,8 +37,7 @@ fn connection(input: &str, context: &str) -> Result<Connection> {
     if input.is_empty() || input == "*" {
         return Ok(result);
     }
-    // A context-qualified code may contain a comma between its two integer
-    // parameters. A new clause starts only at a new F/P/C code or POS prefix.
+    // Commas inside a code do not start a new clause.
     let mut rest = input;
     while !rest.is_empty() {
         rest = rest.trim_start_matches([',', ' ', '\t']);

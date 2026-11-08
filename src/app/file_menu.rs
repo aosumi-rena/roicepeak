@@ -108,15 +108,7 @@ impl EditorApp {
                 true,
             ),
             Item::Separator,
-            command(
-                Export,
-                "出力",
-                "Export",
-                self.project
-                    .blocks
-                    .iter()
-                    .any(|block| !block.text.trim().is_empty()),
-            ),
+            command(Export, "出力", "Export", true),
             Item::Separator,
             command(
                 ReplaceVoices,

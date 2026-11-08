@@ -7,11 +7,10 @@ fn boundary(pos: u32) -> bool {
 }
 
 pub(super) fn overlay(value: &mut Value, sentence: &SentenceState) -> Result<(), String> {
-    if !sentence.query.matches(&sentence.text, &sentence.words)
-        || sentence.word_positions.source != sentence.text
-        || sentence.query.raw.len() != sentence.words.len()
+    if sentence.word_positions.source != sentence.text
+        || sentence.word_positions.ranges.len() != sentence.words.len()
     {
-        return Err("Prepare the current text before saving this edited native sentence".into());
+        return Err("Native Save requires current word positions".into());
     }
     sentence.word_positions.validate(&sentence.words)?;
     let boundaries = sentence
@@ -22,16 +21,7 @@ pub(super) fn overlay(value: &mut Value, sentence: &SentenceState) -> Result<(),
         .collect::<Vec<_>>();
     let mut pairs = Vec::new();
     let mut previous = (0, 0);
-    for ((raw, word), range) in sentence
-        .query
-        .raw
-        .iter()
-        .zip(&sentence.words)
-        .zip(&sentence.word_positions.ranges)
-    {
-        if raw.surface != word.surface || raw.language != word.language || raw.pos != word.pos {
-            return Err("Native word positions no longer match the analyzed words".into());
-        }
+    for (word, range) in sentence.words.iter().zip(&sentence.word_positions.ranges) {
         if boundary(word.pos) {
             if range.is_some() {
                 return Err("Native synthetic boundary cannot own text".into());

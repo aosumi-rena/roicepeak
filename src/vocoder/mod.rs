@@ -1,5 +1,4 @@
 //! LF excitation, learned time-varying filters and subband neural noise.
-//! Float DSP behavior is independently qualified against reference arrays.
 mod analytic_probe;
 mod complex_fft;
 mod dsp;
@@ -18,6 +17,7 @@ mod lf_table;
 mod lf_trig;
 mod lf_window;
 mod ltv_window;
+mod normalization;
 mod postfilter_log;
 mod real_fft;
 mod response;
@@ -25,6 +25,7 @@ mod response_exp;
 mod response_trig;
 mod shape_transfer;
 mod source_probe;
+mod streaming;
 mod transform_probe;
 use crate::{
     Result,
@@ -32,7 +33,6 @@ use crate::{
     graph::{Budget, Graph},
     invalid,
     normalization::Normalizer,
-    sequence::concatenate,
     tensor::{MAX_ELEMENTS, Tensor, u32_at},
 };
 pub use analytic_probe::{
@@ -354,6 +354,7 @@ pub fn diagnostic_ltv_boundaries(
 
 pub struct Vocoder {
     normalizer: Normalizer,
+    input_configuration: normalization::InputConfiguration,
     shape: Graph,
     trunk: Graph,
     harmonic: Graph,
@@ -450,8 +451,11 @@ impl Vocoder {
         if u32_at(c[0].payload, 8)? != 48000 || f32::from_bits(u32_at(c[0].payload, 12)?) != 0.005 {
             return Err(invalid("vocoder requires 48 kHz and 5 ms frame spacing"));
         }
+        let normalizer = Normalizer::from_node(&c[0].children[0])?;
+        let input_configuration = normalization::InputConfiguration::compile(&c[0], &normalizer)?;
         Ok(Self {
-            normalizer: Normalizer::from_node(&c[0].children[0])?,
+            normalizer,
+            input_configuration,
             shape: Graph::compile(&c[1])?,
             trunk: Graph::compile(&c[2])?,
             harmonic: Graph::compile(&c[3].children[0])?,
@@ -480,129 +484,15 @@ impl Vocoder {
         tension: f32,
         budget: &mut Budget,
     ) -> Result<Render> {
-        if !tension.is_finite()
-            || physical.cols() != 72
-            || physical.rows() == 0
-            || physical.rows() > MAX_ELEMENTS / dsp::HOP
-        {
-            return Err(invalid(
-                "vocoder requires nonempty bounded 72-channel frames",
-            ));
-        }
-        let fused = postfilter_log::fused_available();
-        let mut logged = physical.clone();
-        for t in 0..physical.rows() {
-            if logged.row(t)[1] <= 0.0 {
-                return Err(invalid("vocoder F0 must be positive"));
-            }
-            logged.row_mut(t)[1] = postfilter_log::logarithm(logged.row(t)[1], fused);
-        }
-        let normalized = self.normalizer.normalize(&logged, true)?;
-        let logits = self.shape.run_with(&normalized, budget)?;
-        if logits.cols() != 1 {
-            return Err(invalid("vocoder shape output width"));
-        }
-        let shape = Tensor::new(
-            logits.rows(),
-            1,
-            logits
-                .values()
-                .iter()
-                .map(|x| shape_transfer::transfer(*x, 0.0, fused))
-                .collect(),
-        )?;
-        let hidden = self.trunk.run_with(&normalized, budget)?;
-        let source = lf_excitation::excitation(
-            physical,
-            &shape,
-            lf_window::gain(self.excitation_log_gain, fused),
-            budget,
-        )?;
-        let harmonic_parameters = self.harmonic.run_with(&hidden, budget)?;
-        let effect = |kind| {
-            self.effects
-                .active(tension)
-                .then_some((&self.effects, kind, tension, self.sample_rate))
-        };
-        let harmonic = dsp::ltv(
-            &harmonic_parameters,
-            &source,
-            self.spectral,
-            effect(SpectrumKind::Periodic),
-            budget,
-        )?;
-        let postfilter_source = if self.filtered_postfilter_input {
-            &harmonic
-        } else {
-            &source
-        };
-        let subbands = dsp::analysis(postfilter_source, &self.analysis, budget)?;
-        // The active neural postfilter takes unit Gaussian noise. The root's
-        // noise gain belongs to the separate branch without that postfilter.
-        let noise = dsp::postfilter_noise(subbands.rows(), budget)?;
-        let input = concatenate(&[&subbands, &noise], budget)?;
-        let upsampled = dsp::upsample(&normalized, budget)?;
-        let bands = self.projection.run_with(
-            &self
-                .postfilter
-                .run_conditioned(&input, &upsampled, budget)?,
-            budget,
-        )?;
-        if bands.rows() != noise.rows() || bands.cols() != noise.cols() {
-            return Err(invalid("vocoder postfilter dimensions"));
-        }
-        let gated = if self.gate_noise {
-            let fused = postfilter_log::fused_available();
-            Tensor::new(
-                bands.rows(),
-                bands.cols(),
-                bands
-                    .values()
-                    .iter()
-                    .zip(noise.values())
-                    .map(|(b, n)| (1.0 / (1.0 + response_exp::exponential(-*b, fused))) * n)
-                    .collect(),
-            )?
-        } else {
-            bands.clone()
-        };
-        let aperiodic_source = dsp::synthesis(&gated, &self.synthesis, budget)?;
-        let noise_parameters = self.noise.run_with(&hidden, budget)?;
-        let aperiodic = dsp::ltv(
-            &noise_parameters,
-            &aperiodic_source,
-            self.spectral,
-            effect(SpectrumKind::Aperiodic),
-            budget,
-        )?;
-        let pcm = Tensor::new(
-            harmonic.rows(),
-            1,
-            harmonic
-                .values()
-                .iter()
-                .zip(aperiodic.values())
-                .map(|(h, a)| h + a)
-                .collect(),
-        )?;
-        Ok(Render {
-            stages: BTreeMap::from([
-                ("normalized", normalized),
-                ("shape", shape),
-                ("hidden", hidden),
-                ("source", source),
-                ("harmonic-parameters", harmonic_parameters),
-                ("harmonic", harmonic),
-                ("subbands", subbands),
-                ("noise", noise),
-                ("upsampled", upsampled),
-                ("bands", bands),
-                ("gated", gated),
-                ("aperiodic-source", aperiodic_source),
-                ("noise-parameters", noise_parameters),
-                ("aperiodic", aperiodic),
-                ("pcm", pcm),
-            ]),
-        })
+        self.run_with_tension_streamed(physical, tension, budget, &mut |_| Ok(()))
+    }
+    pub fn run_with_tension_streamed(
+        &self,
+        physical: &Tensor,
+        tension: f32,
+        budget: &mut Budget,
+        emit: &mut dyn FnMut(&[f32]) -> Result<()>,
+    ) -> Result<Render> {
+        streaming::render(self, physical, tension, budget, emit)
     }
 }

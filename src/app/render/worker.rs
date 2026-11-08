@@ -6,8 +6,7 @@ use super::{
 };
 use std::sync::{MutexGuard, mpsc};
 
-// Match the enqueue lock order: result destination before diagnostics. Keeping
-// this guard until publication prevents an enqueue from inverting those locks.
+// Lock results before diagnostics, matching enqueue order.
 enum Publication<'a> {
     Render(MutexGuard<'a, Option<(u64, Result<Rendered, String>)>>),
     Prepare(MutexGuard<'a, Option<(u64, Result<PreparedProject, String>)>>),
@@ -237,8 +236,7 @@ impl Default for Worker {
                         } else {
                             result
                         };
-                        // Acquire potentially contended locks before final timing.
-                        // Enqueue also takes result locks before diagnostics.
+                        // Acquire result locks before diagnostics and final timing.
                         let mut publication = match kind {
                             JobKind::Render => {
                                 worker_shared.result.lock().ok().map(Publication::Render)
@@ -281,8 +279,7 @@ impl Default for Worker {
                             }
                             outcome
                         });
-                        // Install final in-memory state before consumers can see
-                        // the result. No file I/O occurs while holding this guard.
+                        // Publish final state before exposing results; keep file I/O outside the lock.
                         if let Some(ledger) = ledger.as_mut() {
                             ledger.record_memory(&profile);
                         }
@@ -371,8 +368,7 @@ impl Default for Worker {
                                 Ordering::Acquire,
                             );
                         }
-                        // Audio/query results and idle state are visible before
-                        // diagnostic serialization or disk I/O can block here.
+                        // Publish results and idle state before writing diagnostics.
                         if let Ok(mut ledger) = worker_shared.diagnostics.lock() {
                             ledger.persist();
                         }

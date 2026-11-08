@@ -1,11 +1,17 @@
 //! Character CNN and word transformer for explicitly supplied language models.
-//! Character caches are accepted only as explicit, identity-matched model inputs.
-use std::collections::HashMap;
+#[path = "language_characters.rs"]
+pub(crate) mod characters;
+#[path = "language_position.rs"]
+mod position;
+use std::{collections::HashMap, sync::OnceLock};
 
 use crate::{
     Result,
     dnni::Node,
-    graph::{Budget, Graph},
+    graph::{
+        Budget, Graph,
+        generated_activation::{GeneratedActivation, Kind},
+    },
     invalid,
     tensor::{Tensor, u32_at},
 };
@@ -16,6 +22,7 @@ pub struct CharacterEncoder {
     alphabet: HashMap<char, usize>,
     table: Tensor,
     convolutions: Vec<Graph>,
+    tanh: GeneratedActivation,
     transform: Graph,
     gate: Graph,
     projection: Graph,
@@ -38,7 +45,11 @@ impl CharacterEncoder {
             return Err(invalid("character encoder structure"));
         }
         let count = u32_at(n.payload, 8)? as usize;
-        if count > 1_000_000 || n.payload.len() != 16 + count * 4 {
+        let output_width = u32_at(n.payload, 12)? as usize;
+        if !(1..=65535).contains(&count)
+            || !(1..=65535).contains(&output_width)
+            || n.payload.len() != 16 + count * 4
+        {
             return Err(invalid("character alphabet length"));
         }
         let mut alphabet = HashMap::new();
@@ -70,44 +81,28 @@ impl CharacterEncoder {
                 .iter()
                 .map(Graph::compile)
                 .collect::<Result<_>>()?,
+            tanh: GeneratedActivation::new(Kind::Tanh)?,
             transform: Graph::compile(&highway.children[0])?,
             gate: Graph::compile(&highway.children[1])?,
             projection: Graph::compile(projection)?,
         })
     }
-    pub fn ids(&self, word: &str) -> [usize; 50] {
-        let mut ids = [0; 50];
-        ids[0] = 1;
-        let mut end = 1;
-        for ch in word.chars().take(48) {
-            ids[end] = self.alphabet.get(&ch).copied().unwrap_or(3);
-            end += 1;
-        }
-        ids[end] = 2;
-        ids
+    pub fn ids(&self, word: &str) -> Vec<usize> {
+        characters::ordinary(word, &self.alphabet)
     }
     pub fn encode(&self, words: &[String], budget: &mut Budget) -> Result<Tensor> {
         let ids: Vec<_> = words.iter().map(|w| self.ids(w)).collect();
         self.encode_ids(&ids, budget)
     }
     /// Special boundary tokens can supply BOW/EOW directly, followed by padding.
-    pub fn encode_ids(&self, words: &[[usize; 50]], budget: &mut Budget) -> Result<Tensor> {
+    pub fn encode_ids(&self, words: &[Vec<usize>], budget: &mut Budget) -> Result<Tensor> {
         if words.is_empty() || words.len() > 4096 {
             return Err(invalid("word count outside 1..4096"));
         }
         let mut maxima = Vec::new();
         let mut width = None;
         for ids in words {
-            let mut embedded = Tensor::zeros(50, self.table.rows())?;
-            budget.spend(0, embedded.values().len())?;
-            for (t, id) in ids.iter().copied().enumerate() {
-                if id >= self.table.cols() {
-                    return Err(invalid("character ID outside table"));
-                }
-                for c in 0..self.table.rows() {
-                    embedded.row_mut(t)[c] = self.table.row(c)[id];
-                }
-            }
+            let embedded = characters::embed(ids, &self.table, budget)?;
             let start = maxima.len();
             for conv in &self.convolutions {
                 let y = conv.run_with(&embedded, budget)?;
@@ -118,8 +113,7 @@ impl CharacterEncoder {
                     maxima.push(
                         (0..y.rows())
                             .map(|t| y.row(t)[c])
-                            .fold(f32::NEG_INFINITY, f32::max)
-                            .tanh(),
+                            .fold(f32::NEG_INFINITY, f32::max),
                     );
                 }
             }
@@ -127,6 +121,8 @@ impl CharacterEncoder {
             if width.replace(cols).is_some_and(|old| old != cols) {
                 return Err(invalid("word embedding widths differ"));
             }
+            budget.spend(cols.saturating_mul(32), 0)?;
+            self.tanh.apply_in_place(&mut maxima[start..])?;
         }
         let h = Tensor::new(words.len(), width.unwrap(), maxima)?;
         let g = self.gate.run_with(&h, budget)?;
@@ -168,7 +164,6 @@ impl CharacterCache {
     }
 
     /// Plain CharEmbeds entries: descriptor, NUL-terminated UTF-8 keys, float32 rows.
-    /// Container discovery and payload extraction belong to the caller.
     pub fn parse(descriptor: &[u8], keys: &[u8], data: &[u8]) -> Result<Self> {
         if descriptor.len() < 8
             || descriptor.len() > 65536
@@ -196,8 +191,9 @@ impl CharacterCache {
         for (row, key) in rows.into_iter().enumerate() {
             let word = std::str::from_utf8(key)
                 .map_err(|_| invalid("character cache key must be UTF-8"))?;
-            // Repeated keys select the last stored row, as in the reference format.
-            words.insert(word.to_owned(), row);
+            if words.insert(word.to_owned(), row).is_some() {
+                return Err(invalid("duplicate character cache key"));
+            }
         }
         Ok(Self {
             identity: descriptor[..8].try_into().unwrap(),
@@ -209,16 +205,22 @@ impl CharacterCache {
 
 #[derive(Debug)]
 pub struct LanguageModel {
-    pub encoder: CharacterEncoder,
+    encoder: CharacterEncoder,
     layers: Vec<Graph>,
     cache: Option<CharacterCache>,
+    boundaries: OnceLock<Tensor>,
 }
 impl LanguageModel {
+    pub fn encoder(&self) -> &CharacterEncoder {
+        &self.encoder
+    }
+
     pub fn estimated_bytes(&self) -> usize {
         crate::memory::sum([
             self.encoder.estimated_bytes(),
             crate::memory::nested(&self.layers, Graph::estimated_bytes),
             crate::memory::optional(&self.cache, CharacterCache::estimated_bytes),
+            self.boundaries.get().map_or(0, Tensor::estimated_bytes),
         ])
     }
 
@@ -238,6 +240,7 @@ impl LanguageModel {
                 .map(Graph::compile)
                 .collect::<Result<_>>()?,
             cache: None,
+            boundaries: OnceLock::new(),
         })
     }
     pub fn set_character_cache(&mut self, cache: CharacterCache) -> Result<()> {
@@ -245,7 +248,20 @@ impl LanguageModel {
             return Err(invalid("character cache does not belong to language model"));
         }
         self.cache = Some(cache);
+        self.boundaries.take();
         Ok(())
+    }
+    fn boundary_embeddings(&self, budget: &mut Budget) -> Result<&Tensor> {
+        if let Some(embeddings) = self.boundaries.get() {
+            return Ok(embeddings);
+        }
+        let value = self
+            .encoder
+            .encode_ids(&[characters::special(1)?, characters::special(2)?], budget)?;
+        let _ = self.boundaries.set(value);
+        self.boundaries
+            .get()
+            .ok_or_else(|| invalid("character boundary embeddings unavailable"))
     }
     /// Exact cached words use their supplied rows; other words use the character CNN.
     pub fn embed(&self, words: &[String], budget: &mut Budget) -> Result<Tensor> {
@@ -293,9 +309,8 @@ impl LanguageModel {
         }
         Ok(out)
     }
-    /// Reference model graph only. Native positional-encoding behavior is unqualified.
     pub fn contextualize(&self, embeddings: &Tensor, budget: &mut Budget) -> Result<Tensor> {
-        let mut x = embeddings.clone();
+        let mut x = position::apply(embeddings, budget)?;
         for layer in &self.layers {
             x = layer.run_with(&x, budget)?;
         }
@@ -322,11 +337,7 @@ impl LanguageModel {
         } else {
             Some(self.embed(&words, budget)?)
         };
-        let mut start = [0; 50];
-        let mut end = [0; 50];
-        start[0] = 1;
-        end[0] = 2;
-        let specials = self.encoder.encode_ids(&[start, end], budget)?;
+        let specials = self.boundary_embeddings(budget)?;
         if words.as_ref().is_some_and(|t| t.cols() != specials.cols()) {
             return Err(invalid("character cache and boundary widths differ"));
         }

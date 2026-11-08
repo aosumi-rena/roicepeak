@@ -4,12 +4,13 @@ mod attention;
 mod conditional;
 mod convolution;
 mod filterbank;
-mod generated_activation;
+pub(crate) mod generated_activation;
 mod matrix_storage;
 mod normalization;
 mod parallel;
 pub mod profiling;
 mod recurrent;
+pub(crate) mod streaming;
 mod transformer;
 
 use crate::{
@@ -35,6 +36,7 @@ pub enum Graph {
     Affine(Affine),
     Activation(Activation),
     GeneratedActivation(GeneratedActivation),
+    Silu(GeneratedActivation),
     Convolution(Convolution),
     Gru(Gru),
     BidirectionalGru(Gru, Gru),
@@ -77,13 +79,17 @@ impl Budget {
 }
 
 impl Graph {
+    pub(crate) fn stream(&self) -> Result<streaming::Stream<'_>> {
+        streaming::Stream::new(self)
+    }
+
     pub fn estimated_bytes(&self) -> usize {
         use crate::memory as m;
         match self {
             Self::Sequential(nodes) => m::nested(nodes, Self::estimated_bytes),
             Self::Transformer(value) => value.estimated_bytes(),
             Self::Affine(value) => value.estimated_bytes(),
-            Self::Activation(_) | Self::GeneratedActivation(_) => 0,
+            Self::Activation(_) | Self::GeneratedActivation(_) | Self::Silu(_) => 0,
             Self::Convolution(value) => value.estimated_bytes(),
             Self::Gru(value) => value.estimated_bytes(),
             Self::BidirectionalGru(a, b) => m::sum([a.estimated_bytes(), b.estimated_bytes()]),
@@ -119,12 +125,16 @@ impl Graph {
                 };
                 Self::GeneratedActivation(GeneratedActivation::new(kind)?)
             }
-            "moda0" | "moda5" | "moda7" => {
+            "moda7" => {
+                payload(n, 0)?;
+                children(n, &[0])?;
+                Self::Silu(GeneratedActivation::new(GeneratedActivationKind::Sigmoid)?)
+            }
+            "moda0" | "moda5" => {
                 payload(n, 0)?;
                 children(n, &[0])?;
                 Self::Activation(match n.tag.as_str() {
                     "moda0" => Activation::Relu,
-                    "moda7" => Activation::Silu,
                     _ => Activation::Identity,
                 })
             }
@@ -244,8 +254,7 @@ impl Graph {
             x.cols(),
             budget.multiply_adds,
         );
-        // Keep every ordinary early-return/error inside this call so the span
-        // can observe the remaining budget on both Result paths.
+        // Record budget consumption on both success and failure.
         let result = self.run_optional_inner(x, condition, budget);
         if let Some(timing) = timing {
             timing.finish(
@@ -284,6 +293,14 @@ impl Graph {
                 )?
             }
             Self::GeneratedActivation(a) => a.run(x, budget)?,
+            Self::Silu(a) => {
+                let mut y = a.run(x, budget)?;
+                budget.spend(x.values().len(), 0)?;
+                for (output, input) in y.values_mut().iter_mut().zip(x.values()) {
+                    *output *= *input;
+                }
+                y
+            }
             Self::Convolution(c) => c.run(x, budget)?,
             Self::Gru(g) => g.run(x, false, budget)?,
             Self::BidirectionalGru(a, b) => {
@@ -343,7 +360,7 @@ impl Graph {
         match self {
             Self::Sequential(_) => "sequential",
             Self::Affine(_) => "affine",
-            Self::Activation(_) | Self::GeneratedActivation(_) => "activation",
+            Self::Activation(_) | Self::GeneratedActivation(_) | Self::Silu(_) => "activation",
             Self::Convolution(layer) => layer.operator_name(),
             Self::Gru(_) => "gru",
             Self::BidirectionalGru(_, _) => "bidirectional_gru",

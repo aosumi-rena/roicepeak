@@ -66,8 +66,7 @@ impl EditorApp {
                 self.begin_edit();
                 self.project.blocks[left] = merged;
                 self.project.blocks.remove(left + 1);
-                // Native removal drops the removed member and clears current
-                // when it referred to that block. It does not pick a successor.
+                // Removing the current block clears its selection.
                 self.selection.prune(&self.project);
                 if self.transport != Transport::Playing {
                     self.selection.focus_current(id);

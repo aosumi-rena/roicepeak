@@ -1,6 +1,4 @@
 //! Bounded morphological analysis of an explicitly supplied UTF-8 dictionary.
-//!
-//! No dictionary discovery, text normalization or pronunciation guessing occurs here.
 mod chars;
 mod dictionary;
 mod matrix;
@@ -195,13 +193,11 @@ impl Tagger {
     }
 
     /// Find the minimum-cost path with stable dictionary/token-order ties.
-    /// BOS/EOS participate in costs but are not returned as surface records.
     pub fn parse(&self, text: &str) -> Result<Vec<Morph>> {
         self.parse_impl(text, None)
     }
 
     /// Resolve the six native user-word context classes against this dictionary.
-    /// Definitions are read only for a nonempty explicit entry list.
     pub fn user_dictionary(&self, words: &[UserWord]) -> Result<UserDictionary> {
         UserDictionary::new(&self.directory, self.lexicons[0].dimensions(), words)
     }

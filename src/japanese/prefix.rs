@@ -21,7 +21,6 @@ fn hangul(input: &str) -> Option<char> {
 }
 
 /// Visits replacements exactly once, in their original byte/scalar frame.
-/// Every emitted replacement scalar owns the whole consumed original interval.
 pub(super) fn walk(
     input: &str,
     excluded: &BTreeSet<char>,

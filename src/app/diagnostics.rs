@@ -27,8 +27,6 @@ mod normalizer;
 mod playback;
 #[path = "diagnostic_pqmf.rs"]
 mod pqmf;
-#[path = "diagnostic_preparation.rs"]
-mod preparation;
 #[path = "diagnostic_reading.rs"]
 mod reading;
 #[path = "diagnostic_response.rs"]
@@ -75,7 +73,6 @@ pub fn dispatch(args: &[OsString]) -> Option<i32> {
         "--process-spectra",
         "--process-response-exponentials",
         "--render-playback",
-        "--prepare-project",
         "--inspect-reading",
         "--inspect-ssml-reading",
         "--inspect-ssml",
@@ -218,7 +215,7 @@ fn run(command: &str, args: &[OsString]) -> Result<(), String> {
     if dictionary_path.is_some()
         && !matches!(
             command,
-            "--render-text" | "--render-project" | "--render-playback" | "--prepare-project"
+            "--render-text" | "--render-project" | "--render-playback"
         )
     {
         return Err("--user-dictionary is supported for text/project synthesis only".into());
@@ -233,9 +230,8 @@ fn run(command: &str, args: &[OsString]) -> Result<(), String> {
         || (command == "--render-text" && args.len() != 3)
         || (command == "--render-project" && args.len() != 2)
         || (command == "--render-playback" && (args.len() != 2 || prepare_first))
-        || (command == "--prepare-project" && (args.len() != 2 || prepare_first))
     {
-        return Err("Usage: roicepeak --inspect-resources [--locations FILE] | --inspect-portrait [--locations FILE] VOICE_KEY EMOTION_KEY | --render-stages [--locations FILE] VOICE_KEY TOKENS.tsv NEW_OUTPUT_PREFIX | --render-text [--locations FILE] [--prepare-first] VOICE_KEY INPUT_UTF8.txt NEW_OUTPUT.wav | --render-project [--locations FILE] [--user-dictionary FILE] [--prepare-first] INPUT.roicepeak NEW_OUTPUT.wav".into());
+        return Err("Usage: roicepeak --inspect-resources [--locations FILE] | --inspect-portrait [--locations FILE] VOICE_KEY EMOTION_KEY | --render-stages [--locations FILE] VOICE_KEY TOKENS.tsv NEW_OUTPUT_PREFIX | --render-text [--locations FILE] [--prepare-first] VOICE_KEY INPUT_UTF8.txt NEW_OUTPUT.wav | --render-project [--locations FILE] [--user-dictionary FILE] [--prepare-first] INPUT.vpp NEW_OUTPUT.wav".into());
     }
     let catalog = Catalog::load_roots(&locations.voice_roots)?;
     if command == "--render-stages" {
@@ -300,11 +296,12 @@ fn run(command: &str, args: &[OsString]) -> Result<(), String> {
         Some(path) => crate::app::dictionary::Snapshot::read(Path::new(path))?,
         None => crate::app::dictionary::Snapshot::empty(),
     };
-    let (mut project, output_path) = if matches!(
-        command,
-        "--render-project" | "--render-playback" | "--prepare-project"
-    ) {
-        (Project::read(Path::new(&args[0]))?, Path::new(&args[1]))
+    let (mut project, output_path) = if matches!(command, "--render-project" | "--render-playback")
+    {
+        (
+            crate::app::project_files::read(Path::new(&args[0]), Some(&config))?,
+            Path::new(&args[1]),
+        )
     } else {
         let key = args[0].to_str().ok_or("Narrator identity must be UTF-8")?;
         let voice = catalog
@@ -333,9 +330,6 @@ fn run(command: &str, args: &[OsString]) -> Result<(), String> {
     }
     if command == "--render-playback" {
         return playback::render(config, project, user_dictionary, output_path);
-    }
-    if command == "--prepare-project" {
-        return preparation::prepare(config, project, user_dictionary, output_path);
     }
     let narrators: std::collections::BTreeSet<_> =
         project.blocks.iter().map(|b| b.narrator.clone()).collect();

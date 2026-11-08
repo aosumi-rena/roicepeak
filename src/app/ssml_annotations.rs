@@ -37,8 +37,7 @@ pub(crate) struct Unassigned {
     pub groups: Vec<Range<usize>>,
 }
 
-// A missing field must be rejected rather than interpreted as an absent queue.
-// deserialize_with bypasses serde's implicit missing-Option default.
+// Require the field even when the annotation queue is absent.
 pub(crate) fn required<'de, D>(deserializer: D) -> Result<Option<Pending>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -58,8 +57,7 @@ pub(crate) fn from_reading(
             prediction_eligible: m.prediction_eligible,
             accent_edited: m.accent_edited,
             intonation_delta: 0.0,
-            // Source is the Japanese SAPI-kana phone sequence. Retained target word
-            // language/POS do not change this source classification.
+            // Classify Japanese pronunciation independently of the target word.
             phones: m
                 .syllable
                 .phones
@@ -69,6 +67,7 @@ pub(crate) fn from_reading(
                     PhoneState {
                         symbol: p.symbol,
                         nucleus,
+                        stored_nucleus: false,
                         duration: DurationState::default(),
                     }
                 })
@@ -122,7 +121,6 @@ impl Pending {
 }
 
 /// Assign an ordered flush queue using the original sentence UTF-8 bytes.
-/// No surface searching, forward skipping, tokenization or dictionary is involved.
 pub(crate) fn assign(block: &mut Block, chunks: Vec<Unassigned>) -> Result<usize, String> {
     if chunks.len() > MAX_ANNOTATIONS {
         return Err("SSML annotation count limit".into());
@@ -168,7 +166,6 @@ pub(crate) fn assign(block: &mut Block, chunks: Vec<Unassigned>) -> Result<usize
 }
 
 /// Apply to raw word order, retaining word surfaces, language, POS and positions.
-/// Synthetic BOS/EOS have no source position and never enter the remaining queue.
 pub(crate) fn apply(
     pending: &Pending,
     positions: &WordPositions,

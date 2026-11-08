@@ -35,7 +35,7 @@ impl Attention {
         let kdim = u32_at(n.payload, 4)? as usize;
         let vdim = u32_at(n.payload, 8)? as usize;
         let heads = u32_at(n.payload, 12)? as usize;
-        if n.payload[16..] != [1, 0, 1, 0] || heads == 0 || qdim == 0 {
+        if n.payload[17] & 1 != 0 || n.payload[19] & 1 != 0 || heads == 0 || qdim == 0 {
             return Err(invalid("unsupported attention flags/head count"));
         }
         if n.children.iter().any(|c| c.tag != "modl0") {

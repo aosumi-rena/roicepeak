@@ -212,9 +212,19 @@ pub(super) fn parse(args: &[OsString]) -> Result<(), String> {
                 case.export_settings,
             )?;
             budget.project(&project)?;
-            Ok(project)
+            Ok(serde_json::json!({
+                "blocks": project.blocks.iter().map(|block| serde_json::json!({
+                    "text": block.text,
+                    "narrator": block.narrator,
+                    "sentences": block.sentences.iter().map(|sentence| serde_json::json!({
+                        "text": sentence.text,
+                        "ssml": sentence.ssml,
+                        "words": sentence.words,
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            }))
         }),
-        "production SSML parse and replacement; no catalog or inference",
+        "production SSML parse inspection; no project serialization, catalog or inference",
     )
 }
 

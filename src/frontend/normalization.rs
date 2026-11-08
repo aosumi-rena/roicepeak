@@ -4,10 +4,7 @@ use crate::{Result, invalid};
 use std::collections::BTreeSet;
 
 impl Tagger {
-    /// Find all raw user-dictionary prefixes at every original scalar boundary.
-    /// Every scalar in any match is excluded throughout this one sentence.
-    /// System/unknown dictionaries, token costs and selected lattice paths do
-    /// not contribute to this set.
+    /// Exclude matched user-word prefixes from sentence normalization.
     pub fn normalization_exclusions(
         &self,
         original: &str,

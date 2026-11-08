@@ -1,5 +1,5 @@
 //! Explicit headless access to the same export backend used by the editor.
-use crate::app::{catalog::Catalog, document::Project, export, render, resources::Locations};
+use crate::app::{catalog::Catalog, export, project_files, render, resources::Locations};
 use serde::Deserialize;
 use std::{collections::BTreeMap, ffi::OsString, io::Read, path::Path};
 
@@ -23,14 +23,13 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
         (None, args)
     };
     if !(args.len() == 4 || (args.len() == 5 && args[4] == "--overwrite")) {
-        return Err("Usage: roicepeak --export-project [--user-dictionary FILE] LOCATIONS.json PROJECT.roicepeak EXPORT.json OUTPUT_DIRECTORY [--overwrite]".into());
+        return Err("Usage: roicepeak --export-project [--user-dictionary FILE] LOCATIONS.json PROJECT.vpp EXPORT.json OUTPUT_DIRECTORY [--overwrite]".into());
     }
     let user_dictionary = match dictionary_path {
         Some(path) => crate::app::dictionary::Snapshot::read(Path::new(path))?,
         None => crate::app::dictionary::Snapshot::empty(),
     };
     let locations = Locations::read(Path::new(&args[0]))?;
-    let project = Project::read(Path::new(&args[1]))?;
     let input = std::fs::File::open(Path::new(&args[2])).map_err(|error| error.to_string())?;
     if !input
         .metadata()
@@ -75,6 +74,7 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
         &catalog,
     )?;
     config.value_policy = policy;
+    let project = project_files::read(Path::new(&args[1]), Some(&config))?;
     let files = export::write_to_directory(
         render::Request {
             config,

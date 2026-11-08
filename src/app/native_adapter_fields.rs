@@ -1,4 +1,4 @@
-//! Typed reads of the observed native project schema.
+//! Typed project-field access.
 use serde_json::{Map, Value};
 
 #[derive(Clone, Copy)]

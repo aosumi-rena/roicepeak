@@ -120,15 +120,29 @@ impl EditorApp {
             .unwrap_or(crate::app::style::TEXT)
     }
     pub(crate) fn reload_voices(&mut self) -> Result<(), String> {
-        let catalog = Catalog::load_roots(&self.resources.voice_roots)?;
+        let catalog = match Catalog::load_roots(&self.resources.voice_roots) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.replace_voice_catalog(Catalog::default(), None);
+                return Err(error);
+            }
+        };
         let config = match self.resources.dictionary.clone() {
             Some(dictionary) if !catalog.voices.is_empty() => {
-                Some(Config::from_catalog(dictionary, &catalog)?)
+                Config::from_catalog(dictionary, &catalog).map(Some)
             }
-            _ => None,
+            _ => Ok(None),
         };
-        self.replace_voice_catalog(catalog, config);
-        Ok(())
+        match config {
+            Ok(config) => {
+                self.replace_voice_catalog(catalog, config);
+                Ok(())
+            }
+            Err(error) => {
+                self.replace_voice_catalog(catalog, None);
+                Err(error)
+            }
+        }
     }
     pub(crate) fn replace_voice_catalog(&mut self, catalog: Catalog, config: Option<Config>) {
         self.query_basis_current = false;

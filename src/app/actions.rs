@@ -277,6 +277,6 @@ impl EditorApp {
         if selection.is_empty() {
             return Err("Select text to delete".into());
         }
-        self.replace_script_text(ctx, index, selection, &[])
+        self.replace_script_text(ctx, index, selection, "")
     }
 }

@@ -305,6 +305,18 @@ impl EditorApp {
                     close = true;
                 }
             });
+        if (!open || close)
+            && (draft.voice_roots != self.resources.voice_roots
+                || draft.dictionary != self.resources.dictionary
+                || draft.show_portrait != self.resources.show_portrait)
+        {
+            if let Err(error) = self.apply_resource_locations(draft.clone()) {
+                self.error = Some(error);
+                self.resource_settings = true;
+                self.resource_draft = Some(draft);
+                return;
+            }
+        }
         self.resource_settings = open && !close;
         self.resource_draft = self.resource_settings.then_some(draft);
     }
@@ -315,16 +327,9 @@ impl EditorApp {
         locations.dictionary = draft.dictionary;
         locations.show_portrait = draft.show_portrait;
         locations.validate()?;
-        let catalog = crate::app::catalog::Catalog::load_roots(&locations.voice_roots)?;
-        let config = locations
-            .dictionary
-            .clone()
-            .filter(|_| !catalog.voices.is_empty())
-            .map(|dictionary| crate::app::render::Config::from_catalog(dictionary, &catalog))
-            .transpose()?;
         locations.save()?;
         self.resources = locations;
-        self.replace_voice_catalog(catalog, config);
-        Ok(())
+        self.settings_state.loaded(&self.resources);
+        self.reload_voices()
     }
 }

@@ -1,7 +1,7 @@
 //! Format-1 plain voice descriptions and narrator metadata.
 #[path = "factory.rs"]
 mod factory;
-use super::{Voice, resolve};
+use super::{Voice, inheritance::Resolved, resolve, style_rows};
 use crate::app::render::{EmotionBinding, VoiceBinding};
 use roicepeak::{
     dnni,
@@ -20,11 +20,13 @@ use std::{
 struct Description {
     name: String,
     format: u32,
-    base: Option<serde_json::Value>,
     network: String,
     components: Components,
     pack_names: PackNames,
     entrance: Entrance,
+    languages: Option<Vec<String>>,
+    hex: Option<String>,
+    emotions: Option<BTreeMap<String, String>>,
 }
 #[derive(Deserialize)]
 struct Components {
@@ -68,7 +70,7 @@ struct Emotion {
     standing_pic_id: Option<String>,
 }
 
-fn text(value: &str) -> Result<(), String> {
+pub(super) fn text(value: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > 4096 || value.contains('\0') {
         Err("Invalid narrator metadata text".into())
     } else {
@@ -86,7 +88,6 @@ fn required(entrance: &Entrance, key: &str, limit: usize) -> Result<Vec<u8>, Str
     inline(entrance, key, limit)?.ok_or_else(|| format!("Voice entrance lacks {key}"))
 }
 /// Artwork can be inline bytes or a content-addressed JPEG in the resource root.
-/// Missing artwork does not disable synthesis.
 fn artwork(root: &resolve::Root, entrance: &Entrance, key: &str, limit: usize) -> Option<Vec<u8>> {
     match super::artwork::load_declared(root, &entrance.files, &entrance.assets, key, limit) {
         Ok(bytes) => bytes,
@@ -118,25 +119,40 @@ fn offset(entrance: &Entrance, key: &str) -> Result<Option<usize>, String> {
         .map(|v| v.filter(|n| *n != 0))
 }
 
-pub(super) fn load(root: &resolve::Root, source: &Path, bytes: Vec<u8>) -> Result<Voice, String> {
+pub(super) fn load(
+    root: &resolve::Root,
+    source: &Path,
+    bytes: Arc<Vec<u8>>,
+    resolved: Resolved,
+) -> Result<Voice, String> {
     let canonical_root = fs::canonicalize(root).map_err(|e| e.to_string())?;
     if !source.starts_with(&canonical_root) {
         return Err("Voice metadata escapes its root".into());
     }
-    let description: Description = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    text(&description.name)?;
-    if description.format != 1 || description.base.is_some() {
-        return Err(
-            "A complete format-1 plain voice is required; inherited voices are not resolved".into(),
-        );
+    let expanded = serde_json::to_vec(&resolved.fields).map_err(|e| e.to_string())?;
+    if expanded.len() > 8 * 1024 * 1024 {
+        return Err("Resolved voice metadata byte limit".into());
     }
+    let description: Description = serde_json::from_slice(&expanded).map_err(|e| e.to_string())?;
+    text(&description.name)?;
+    if description.format != 1 {
+        return Err("Voice description requires format 1".into());
+    }
+    let network_root = resolve::Root::plain(resolved.network_root);
+    let components_root = resolve::Root::plain(resolved.components_root);
+    let entrance_root = resolve::Root::plain(resolved.entrance_root);
     if description.entrance.files.len() > 1024 || description.entrance.assets.len() > 1024 {
         return Err("Voice entrance item count limit".into());
     }
     let entrance = &description.entrance;
-    let narrator: Narrator =
+    let mut narrator: Narrator =
         serde_json::from_slice(&required(entrance, "pub/rc/idc.json", 65_536)?)
             .map_err(|e| format!("Narrator metadata: {e}"))?;
+    if resolved.derived
+        && let Some(languages) = &description.languages
+    {
+        narrator.supported_language_list = languages.clone();
+    }
     for value in [
         &narrator.inst_id,
         &narrator.narrator_id,
@@ -165,7 +181,7 @@ pub(super) fn load(root: &resolve::Root, source: &Path, bytes: Vec<u8>) -> Resul
     let network = PathBuf::from("networks").join(resolve::id(&description.network)?);
     let language = PathBuf::from("components/lm").join(resolve::id(&description.components.lm)?);
     let vocoder = PathBuf::from("components/vo").join(resolve::id(&description.components.vo)?);
-    let stylebook = required(entrance, "stylebook.dnni", 16 * 1024 * 1024)?;
+    let mut stylebook = required(entrance, "stylebook.dnni", 16 * 1024 * 1024)?;
     let offsets = Offsets {
         aperiodicity: offset(entrance, "stylebook_bap_offset_start")?,
         volume: offset(entrance, "stylebook_volume_start")?,
@@ -177,6 +193,17 @@ pub(super) fn load(root: &resolve::Root, source: &Path, bytes: Vec<u8>) -> Resul
             None
         },
     };
+    // Explicit zero offsets disable fields; absent offsets use the format default.
+    let offsets = [
+        "stylebook_bap_offset_start",
+        "stylebook_volume_start",
+        "stylebook_int_offset_start",
+        "stylebook_overall_speed_start",
+        "stylebook_tension_start",
+    ]
+    .iter()
+    .any(|key| entrance.files.contains_key(*key))
+    .then_some(offsets);
     let style_phonemes = inline(entrance, "stylebook_phoneme_list", 65_536)?
         .map(|b| {
             b.split(|v| *v == 0)
@@ -190,9 +217,33 @@ pub(super) fn load(root: &resolve::Root, source: &Path, bytes: Vec<u8>) -> Resul
         })
         .transpose()?
         .unwrap_or_default();
+    if let Some(emotions) = description
+        .emotions
+        .as_ref()
+        .filter(|rows| !rows.is_empty())
+    {
+        let acoustic_path = resolve::file(&network_root, &network.join("am.dnni"))?;
+        let acoustic_bytes = resolve::read(&acoustic_path, dnni::MAX_BYTES)?;
+        let acoustic = dnni::parse(&acoustic_bytes).map_err(|e| e.to_string())?;
+        let embedding_channels = if acoustic.tag == "_ttsna0" {
+            None
+        } else {
+            Some(
+                roicepeak::modern::style_embedding_channels(&acoustic)
+                    .map_err(|e| e.to_string())?,
+            )
+        };
+        style_rows::replace(
+            &mut stylebook,
+            emotions,
+            offsets.as_ref(),
+            &style_phonemes,
+            embedding_channels,
+        )?;
+    }
     let style = Stylebook::compile(
         &dnni::parse(&stylebook).map_err(|e| e.to_string())?,
-        Some(offsets.clone()),
+        offsets.clone(),
         style_phonemes.clone(),
     )
     .map_err(|e| e.to_string())?;
@@ -224,7 +275,7 @@ pub(super) fn load(root: &resolve::Root, source: &Path, bytes: Vec<u8>) -> Resul
     }
     let portrait_bytes = portrait_declarations
         .get(&narrator.main_emotion_engine_key)
-        .and_then(|key| artwork(root, entrance, key, 16 * 1024 * 1024));
+        .and_then(|key| artwork(&entrance_root, entrance, key, 16 * 1024 * 1024));
     let mut emotion_bindings = Vec::new();
     let mut emotions = Vec::new();
     for emotion in narrator.emotion_list {
@@ -251,7 +302,18 @@ pub(super) fn load(root: &resolve::Root, source: &Path, bytes: Vec<u8>) -> Resul
     }
     let mut weights = vec![0.0; style.emotions.len()];
     weights[main] = 1.0;
-    let speaker_vector = inline(entrance, "spkvec", 4 * 1024 * 1024)?
+    let speaker_bytes = if let Some(hex) = &description.hex {
+        let vector = style_rows::floats(hex, 4 * 1024 * 1024)?;
+        if resolved.derived && vector.len() % 16 != 0 {
+            return Err("Derived voice requires four equal float32 speaker vectors".into());
+        }
+        Some(vector)
+    } else if resolved.derived {
+        return Err("Derived voice requires speaker vectors".into());
+    } else {
+        inline(entrance, "spkvec", 4 * 1024 * 1024)?
+    };
+    let speaker_vector = speaker_bytes
         .map(|b| {
             if b.is_empty() || b.len() % 4 != 0 {
                 return Err("Speaker vector must contain float32 values".to_owned());
@@ -267,9 +329,10 @@ pub(super) fn load(root: &resolve::Root, source: &Path, bytes: Vec<u8>) -> Resul
         })
         .transpose()?;
     let speaker = factory::speaker_identity(&description, speaker_vector.is_some())?;
-    let mut metadata_files = Vec::new();
+    let speaker = if resolved.derived { 0 } else { speaker };
+    let mut metadata_files = resolved.dependencies;
     let mut model_flag = |name: &str| -> Result<bool, String> {
-        let value = resolve::flag(root, &network.join(name))?;
+        let value = resolve::flag(&network_root, &network.join(name))?;
         let flag = value.as_ref().is_some_and(|(_, b)| b[0] == 1);
         if let Some(value) = value {
             metadata_files.push(value);
@@ -285,23 +348,23 @@ pub(super) fn load(root: &resolve::Root, source: &Path, bytes: Vec<u8>) -> Resul
         .map(|id| {
             let directory = PathBuf::from("components/charembeds").join(resolve::id(id)?);
             Ok::<_, String>(CharacterCacheResources {
-                descriptor: resolve::file(root, &directory.join("desc"))?,
-                keys: resolve::file(root, &directory.join("key"))?,
-                data: resolve::file(root, &directory.join("data"))?,
+                descriptor: resolve::file(&components_root, &directory.join("desc"))?,
+                keys: resolve::file(&components_root, &directory.join("key"))?,
+                data: resolve::file(&components_root, &directory.join("data"))?,
             })
         })
         .transpose()?;
     let resources = ModelResources {
-        phonemes: resolve::file(root, &network.join("pe.dnni"))?,
-        language: resolve::file(root, &language.join("lm.dnni"))?,
-        intonation: resolve::file(root, &network.join("im.dnni"))?,
-        accent: resolve::file(root, &network.join("acc2int.dnni"))?,
-        acoustic: resolve::file(root, &network.join("am.dnni"))?,
-        vocoder: resolve::file(root, &vocoder.join("vocoder.dnni"))?,
+        phonemes: resolve::file(&network_root, &network.join("pe.dnni"))?,
+        language: resolve::file(&components_root, &language.join("lm.dnni"))?,
+        intonation: resolve::file(&network_root, &network.join("im.dnni"))?,
+        accent: resolve::file(&network_root, &network.join("acc2int.dnni"))?,
+        acoustic: resolve::file(&network_root, &network.join("am.dnni"))?,
+        vocoder: resolve::file(&components_root, &vocoder.join("vocoder.dnni"))?,
         stylebook,
         speaker_vector,
         speaker,
-        offsets: Some(offsets),
+        offsets,
         style_phonemes,
         character_cache,
         weights,
@@ -322,7 +385,15 @@ pub(super) fn load(root: &resolve::Root, source: &Path, bytes: Vec<u8>) -> Resul
     if model_bytes > 768 * 1024 * 1024 {
         return Err("Narrator model resource byte limit".into());
     }
-    let avatar = artwork(root, entrance, "pub/rc/avatar.jpg", 2 * 1024 * 1024);
+    let avatar = artwork(
+        &entrance_root,
+        entrance,
+        "pub/rc/avatar.jpg",
+        2 * 1024 * 1024,
+    );
+    for problem in entrance_root.take_problems() {
+        root.problem(problem);
+    }
     let portrait_main = match portrait_bytes
         .map(|bytes| super::artwork::portrait(bytes, narrator.standing_pic_default_region))
         .transpose()
@@ -335,16 +406,28 @@ pub(super) fn load(root: &resolve::Root, source: &Path, bytes: Vec<u8>) -> Resul
             None
         }
     };
-    let source_bytes = Arc::new(bytes);
+    let source_bytes = bytes;
     let portrait_sources = super::PortraitSources::new(
-        root,
-        Arc::clone(&source_bytes),
+        &entrance_root,
+        if resolved.derived {
+            Arc::new(expanded)
+        } else {
+            Arc::clone(&source_bytes)
+        },
         portrait_declarations,
         narrator.standing_pic_default_region,
     );
     Ok(Voice {
-        key: narrator.inst_id,
-        name: narrator.narrator_id,
+        key: if resolved.derived {
+            description.name.clone()
+        } else {
+            narrator.inst_id
+        },
+        name: if resolved.derived {
+            description.name.clone()
+        } else {
+            narrator.narrator_id
+        },
         collection_name: description.name,
         version: narrator.version,
         vendor: narrator.vendor,

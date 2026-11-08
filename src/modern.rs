@@ -6,13 +6,13 @@ use crate::{
     invalid,
     lingual::Lingual,
     normalization::Normalizer,
-    sampling::{NormalStream, Sampler, frame_noise},
+    sampling::{NoiseKind, NormalStream, Sampler, frame_noise},
     sequence::{broadcast, concatenate, cosine_bank, positions, repeat},
-    tensor::{Tensor, u32_at},
+    tensor::{MAX_ELEMENTS, Tensor, u32_at},
 };
 
 fn stage<'a, 'b>(root: &'b Node<'a>, tags: &[&str]) -> Result<&'b Node<'a>> {
-    if !["_ttscs0", "_ttscs1"].contains(&root.tag.as_str()) {
+    if !["_ttscs1", "_ttscs2"].contains(&root.tag.as_str()) {
         return Err(invalid("modern acoustic root"));
     }
     let mut found = root
@@ -73,6 +73,7 @@ pub struct PitchModel {
     convolution: Graph,
     sampler: Sampler,
     acoustic: Normalizer,
+    noise_kind: NoiseKind,
 }
 impl PitchModel {
     pub fn estimated_bytes(&self) -> usize {
@@ -90,6 +91,9 @@ impl PitchModel {
 
     pub fn noise_channels(&self) -> usize {
         self.sampler.channels
+    }
+    pub(crate) fn noise_stream(&self) -> NormalStream {
+        NormalStream::with_kind(self.noise_kind)
     }
     pub fn compile(root: &Node<'_>) -> Result<Self> {
         let n = stage(root, &["_ttsdf0", "_ttsdf1"])?;
@@ -121,6 +125,7 @@ impl PitchModel {
             convolution: Graph::compile(&c[4])?,
             sampler: Sampler::compile(&n.children[2])?,
             acoustic: Normalizer::from_node(stats[0])?,
+            noise_kind: NoiseKind::for_stage(&n.tag),
         })
     }
     pub fn run(
@@ -179,7 +184,7 @@ impl PitchModel {
                 self.sampler.channels,
                 0.5,
                 None,
-                &mut NormalStream::default(),
+                &mut self.noise_stream(),
                 budget,
             )?;
             &generated
@@ -206,7 +211,83 @@ pub struct AcousticDecoder {
     aux_head: Graph,
     normalizer: Normalizer,
     pub frame_period: f32,
+    noise_kind: NoiseKind,
 }
+
+#[derive(Clone, Copy)]
+pub(crate) struct StyleLayout {
+    channels: usize,
+    separate: bool,
+}
+
+impl StyleLayout {
+    pub(crate) fn compile(
+        root: &Node<'_>,
+        pitch: &PitchModel,
+        decoder: &AcousticDecoder,
+    ) -> Result<Self> {
+        Self::from_channels(root, pitch.style_channels, decoder.style_channels)
+    }
+
+    fn from_channels(root: &Node<'_>, pitch: usize, decoder: usize) -> Result<Self> {
+        if !["_ttscs1", "_ttscs2"].contains(&root.tag.as_str()) {
+            return Err(invalid("modern acoustic root"));
+        }
+        if pitch != decoder {
+            return Err(invalid("pitch and timbre style widths differ"));
+        }
+        let separate = root.tag == "_ttscs2";
+        if pitch
+            .checked_mul(if separate { 2 } else { 1 })
+            .is_none_or(|channels| channels > MAX_ELEMENTS)
+        {
+            return Err(invalid("model style width exceeds tensor budget"));
+        }
+        Ok(Self {
+            channels: pitch,
+            separate,
+        })
+    }
+
+    pub(crate) fn channels(self) -> usize {
+        self.channels * if self.separate { 2 } else { 1 }
+    }
+
+    pub(crate) fn split(self, values: &[f32]) -> Result<(&[f32], &[f32])> {
+        if values.len() != self.channels() {
+            return Err(invalid("model style embedding width"));
+        }
+        if self.separate {
+            Ok(values.split_at(self.channels))
+        } else {
+            Ok((values, values))
+        }
+    }
+}
+
+pub fn style_embedding_channels(root: &Node<'_>) -> Result<usize> {
+    let pitch = stage(root, &["_ttsdf0", "_ttsdf1"])?;
+    let decoder = stage(root, &["_ttsdt0", "_ttsdt1"])?;
+    if pitch.children.len() != 3 || decoder.children.len() != 8 {
+        return Err(invalid("modern acoustic stage children"));
+    }
+    let pitch = &pitch.children[1];
+    let decoder = &decoder.children[2];
+    if pitch.payload.len() != 12
+        || pitch.children.len() != 6
+        || decoder.payload.len() != 8
+        || decoder.children.len() != 3
+    {
+        return Err(invalid("modern style conditioning structure"));
+    }
+    Ok(StyleLayout::from_channels(
+        root,
+        u32_at(pitch.payload, 4)? as usize,
+        u32_at(decoder.payload, 4)? as usize,
+    )?
+    .channels())
+}
+
 impl AcousticDecoder {
     pub fn estimated_bytes(&self) -> usize {
         crate::memory::sum([
@@ -225,6 +306,9 @@ impl AcousticDecoder {
 
     pub fn noise_channels(&self) -> usize {
         self.sampler.channels
+    }
+    pub(crate) fn noise_stream(&self) -> NormalStream {
+        NormalStream::with_kind(self.noise_kind)
     }
     pub fn compile(root: &Node<'_>) -> Result<Self> {
         let n = stage(root, &["_ttsdt0", "_ttsdt1"])?;
@@ -255,6 +339,7 @@ impl AcousticDecoder {
             aux_head: Graph::compile(&c[7])?,
             normalizer: Normalizer::from_node(&front.children[2])?,
             frame_period,
+            noise_kind: NoiseKind::for_stage(&n.tag),
         })
     }
     pub fn normalize_hz(&self, hz: &Tensor) -> Result<Tensor> {
@@ -316,7 +401,7 @@ impl AcousticDecoder {
                 self.sampler.channels,
                 0.75,
                 None,
-                &mut NormalStream::default(),
+                &mut self.noise_stream(),
                 budget,
             )?;
             &generated

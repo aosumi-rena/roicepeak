@@ -1,6 +1,4 @@
 //! Saturating retained-heap charges, excluding each owner's inline storage.
-//! Capacities include allocation slack; container charges are conservative,
-//! allocator-independent estimates rather than process RSS measurements.
 use std::{
     collections::{BTreeMap, HashMap},
     hash::BuildHasher,

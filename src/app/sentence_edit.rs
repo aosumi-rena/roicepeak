@@ -2,6 +2,9 @@ use crate::app::document::WordState;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
+mod richpaste;
+pub(crate) use richpaste::replace_rich;
+
 pub(crate) const MAX_TEXT_BYTES: usize = 1_000_000;
 pub(crate) const MAX_WORDS: usize = 4096;
 pub(crate) const MAX_PHONES: usize = 100_000;
@@ -11,12 +14,14 @@ pub(crate) const MAX_PHONES: usize = 100_000;
 pub(crate) struct WordPositions {
     pub source: String,
     pub ranges: Vec<Option<Range<usize>>>,
+    pub raw_ranges: Vec<Option<[i32; 2]>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PositionedWord {
     pub range: Range<usize>,
+    pub raw_range: Option<[i32; 2]>,
     pub state: WordState,
 }
 
@@ -33,15 +38,9 @@ pub(crate) struct Fragment {
 pub(crate) struct SourceSentence<'a> {
     text: &'a str,
     words: &'a [WordState],
-    positions: &'a WordPositions,
+    raw_ranges: Vec<Option<[i32; 2]>>,
     pending: Option<&'a crate::app::document::ssml::Pending>,
     boundaries: Vec<usize>,
-}
-
-struct PendingWord {
-    state: WordState,
-    range: Option<Range<usize>>,
-    anchor: usize,
 }
 
 fn boundary(word: &WordState) -> bool {
@@ -140,13 +139,34 @@ impl WordPositions {
                     .transpose()
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let raw_ranges = signed_ranges(&ranges)?;
         Ok(Self {
             source: text.to_owned(),
             ranges,
+            raw_ranges,
         })
     }
 
+    pub(crate) fn stored_ranges(&self, word_count: usize) -> Result<Vec<Option<[i32; 2]>>, String> {
+        if !self.raw_ranges.is_empty() {
+            if self.raw_ranges.len() != word_count {
+                return Err("Stored word positions do not match their words".into());
+            }
+            return Ok(self.raw_ranges.clone());
+        }
+        if self.ranges.len() == word_count {
+            return signed_ranges(&self.ranges);
+        }
+        if self.ranges.is_empty() {
+            return Ok(vec![None; word_count]);
+        }
+        Err("Word positions do not match their words".into())
+    }
+
     pub(crate) fn validate(&self, words: &[WordState]) -> Result<(), String> {
+        if !self.raw_ranges.is_empty() && self.raw_ranges.len() != words.len() {
+            return Err("Stored word positions do not match their words".into());
+        }
         if self.source.is_empty() && self.ranges.is_empty() {
             return Ok(());
         }
@@ -181,9 +201,7 @@ impl<'a> SourceSentence<'a> {
         if let Some(pending) = pending {
             pending.validate(text)?;
         }
-        if positions.source != text || positions.ranges.len() != words.len() {
-            return Err("Original word positions belong to different sentence text".into());
-        }
+        let raw_ranges = positions.stored_ranges(words.len())?;
         let mut budget = ValidationBudget::default();
         for word in words {
             validate_word(word, &mut budget)?;
@@ -191,7 +209,7 @@ impl<'a> SourceSentence<'a> {
         Ok(Self {
             text,
             words,
-            positions,
+            raw_ranges,
             pending,
             boundaries: text_boundaries(text)?,
         })
@@ -214,20 +232,23 @@ impl<'a> SourceSentence<'a> {
         }
         let text =
             self.text[self.boundaries[selection.start]..self.boundaries[selection.end]].to_owned();
-        let words = self
-            .words
-            .iter()
-            .zip(&self.positions.ranges)
-            .filter_map(|(word, range)| {
-                let range = range.as_ref()?;
-                (range.start >= selection.start && range.end <= selection.end).then(|| {
-                    PositionedWord {
-                        range: range.start - selection.start..range.end - selection.start,
-                        state: word.clone(),
-                    }
-                })
-            })
-            .collect();
+        let mut words = Vec::new();
+        for (word, raw) in self.words.iter().zip(&self.raw_ranges) {
+            let Some([start, end]) = *raw else {
+                continue;
+            };
+            if i64::from(start) < selection.start as i64 || i64::from(end) > selection.end as i64 {
+                continue;
+            }
+            if end <= start {
+                return Err("Copied word has no nonempty text range".into());
+            }
+            words.push(PositionedWord {
+                range: start as usize - selection.start..end as usize - selection.start,
+                raw_range: *raw,
+                state: word.clone(),
+            });
+        }
         Ok(Some(Fragment {
             text,
             completes_sentence: selection.end == self.char_len(),
@@ -263,247 +284,49 @@ impl Fragment {
 pub(crate) fn replace(
     block: &crate::app::document::Block,
     selection: Range<usize>,
-    inserted: &[Fragment],
+    inserted: &str,
 ) -> Result<crate::app::document::Block, String> {
-    use crate::app::document::SentenceState;
-    let mut budget = ValidationBudget::default();
-    for fragment in inserted {
-        fragment.validate(&mut budget)?;
-    }
+    text_boundaries(inserted)?;
     let boundaries = text_boundaries(&block.text)?;
-    let length = boundaries.len() - 1;
-    if selection.start > selection.end || selection.end > length {
+    if selection.start > selection.end || selection.end >= boundaries.len() {
         return Err("Text selection is outside its block".into());
     }
-    let mut staged = block.clone();
-    staged.sync_sentences()?;
-    let pending_before = staged
-        .sentences
-        .iter()
-        .any(|sentence| sentence.ssml.is_some())
-        .then(|| staged.clone());
-    let ranges = staged.sentence_ranges();
-    let first = ranges
-        .iter()
-        .position(|range| range.chars.end > selection.start)
-        .unwrap_or(ranges.len().saturating_sub(1));
-    let last = ranges
-        .iter()
-        .rposition(|range| range.chars.start < selection.end.max(selection.start + 1))
-        .unwrap_or(first);
-    let lower = ranges.get(first).map_or(0, |range| range.chars.start);
-    let upper = ranges.get(last).map_or(0, |range| range.chars.end);
-    let mut text = block.text[boundaries[lower]..boundaries[selection.start]].to_owned();
-    let prefix = text.chars().count();
-    let mut forced = Vec::new();
-    let mut pasted = Vec::new();
-    let mut count = prefix;
-    for (index, fragment) in inserted.iter().enumerate() {
-        if index != 0 {
-            forced.push(count);
-        }
-        pasted.extend(fragment.words.iter().map(|word| PendingWord {
-            state: word.state.clone(),
-            range: Some(word.range.start + count..word.range.end + count),
-            anchor: word.range.start + count,
-        }));
-        text.push_str(&fragment.text);
-        count += fragment.text.chars().count();
-    }
-    let added = count - prefix;
-    text.push_str(&block.text[boundaries[selection.end]..boundaries[upper]]);
-    let inserted_bytes = inserted.iter().try_fold(0usize, |total, fragment| {
-        total
-            .checked_add(fragment.text.len())
-            .ok_or("Clipboard text size overflow")
-    })?;
-    if block.text.len() - (boundaries[selection.end] - boundaries[selection.start]) + inserted_bytes
-        > MAX_TEXT_BYTES
+    let replaced = boundaries[selection.end] - boundaries[selection.start];
+    if (block.text.len() - replaced)
+        .checked_add(inserted.len())
+        .is_none_or(|length| length > MAX_TEXT_BYTES)
     {
         return Err("Edited block exceeds its text limit".into());
     }
-    let mut before = Vec::new();
-    let mut after = Vec::new();
-    for (index, sentence) in staged
-        .sentences
-        .iter()
-        .enumerate()
-        .take(last + 1)
-        .skip(first)
-    {
-        if !selection.is_empty()
-            && selection.start <= ranges[index].chars.start
-            && selection.end >= ranges[index].chars.end
-        {
-            continue;
-        }
-        let valid = sentence.word_positions.source == sentence.text
-            && sentence.word_positions.ranges.len() == sentence.words.len();
-        for (word_index, word) in sentence.words.iter().enumerate() {
-            if boundary(word) {
-                continue;
-            }
-            let original = valid
-                .then(|| sentence.word_positions.ranges[word_index].clone())
-                .flatten()
-                .map(|range| {
-                    range.start + ranges[index].chars.start..range.end + ranges[index].chars.start
-                });
-            if !selection.is_empty()
-                && original.as_ref().is_some_and(|range| {
-                    range.start >= selection.start && range.end <= selection.end
-                })
-            {
-                continue;
-            }
-            let target = original
-                .as_ref()
-                .map(|range| range.end <= selection.start)
-                .unwrap_or(false);
-            let moved = original.as_ref().and_then(|range| {
-                if range.end <= selection.start {
-                    Some(range.start - lower..range.end - lower)
-                } else if range.start >= selection.end {
-                    let shift = selection.start - lower + added;
-                    Some(range.start - selection.end + shift..range.end - selection.end + shift)
-                } else {
-                    None
-                }
-            });
-            let owner_start = original
-                .as_ref()
-                .map_or(ranges[index].chars.start, |range| range.start);
-            let anchor = moved.as_ref().map_or_else(
-                || {
-                    if owner_start < selection.start {
-                        owner_start.saturating_sub(lower)
-                    } else if owner_start >= selection.end {
-                        prefix + added + owner_start - selection.end
-                    } else {
-                        prefix + added
-                    }
-                },
-                |range| range.start,
-            );
-            let pending = PendingWord {
-                state: word.clone(),
-                range: moved,
-                anchor,
-            };
-            if target {
-                before.push(pending);
-            } else {
-                after.push(pending);
-            }
-        }
-    }
-    before.extend(pasted);
-    before.extend(after);
-    let byte_boundaries = text_boundaries(&text)?;
-    let mut breaks = Vec::new();
-    if inserted.len() < 2 {
-        breaks.extend(
-            crate::app::sentences::partition(&text)
-                .iter()
-                .map(|range| range.chars.end),
-        );
-    } else {
-        forced.push(byte_boundaries.len() - 1);
-        let mut group_start = 0;
-        for (index, group_end) in forced.into_iter().enumerate() {
-            let merges_prefix = index == 0 && prefix != 0;
-            let merges_suffix = index + 1 == inserted.len() && upper > selection.end;
-            if merges_prefix || merges_suffix {
-                let group = &text[byte_boundaries[group_start]..byte_boundaries[group_end]];
-                breaks.extend(
-                    crate::app::sentences::partition(group)
-                        .iter()
-                        .map(|range| range.chars.end + group_start),
-                );
-            } else {
-                breaks.push(group_end);
-            }
-            group_start = group_end;
-        }
-    }
-    breaks.sort_unstable();
-    breaks.dedup();
-    if breaks.len() > 10_000 {
-        return Err("Edited sentence count limit".into());
-    }
-    let mut updated = Vec::new();
-    let mut output_budget = ValidationBudget::default();
-    let mut start = 0;
-    for end in breaks {
-        if end <= start {
-            continue;
-        }
-        let part = text[byte_boundaries[start]..byte_boundaries[end]].to_owned();
-        let mut words = Vec::new();
-        let mut positions = Vec::new();
-        for pending in &before {
-            if pending.anchor < start
-                || (pending.anchor >= end
-                    && !(end == byte_boundaries.len() - 1 && pending.anchor == end))
-            {
-                continue;
-            }
-            validate_word(&pending.state, &mut output_budget)?;
-            words.push(pending.state.clone());
-            positions.push(pending.range.as_ref().and_then(|range| {
-                (range.start >= start && range.end <= end)
-                    .then(|| range.start - start..range.end - start)
-            }));
-        }
-        staged.sentence_serial = staged
-            .sentence_serial
-            .checked_add(1)
-            .ok_or("Sentence identity exhausted")?;
-        let native_owner = ranges
-            .iter()
-            .find(|r| r.chars.start == lower + start && r.chars.end == lower + end)
-            .and_then(|r| staged.sentences.get(r.index))
-            .filter(|s| s.text == part)
-            .and_then(|s| s.native_owner);
-        updated.push(SentenceState {
-            native_owner,
-            id: staged.sentence_serial,
-            text: part.clone(),
-            words,
-            word_positions: WordPositions {
-                source: part,
-                ranges: positions,
-            },
-            query: Default::default(),
-            ssml: None,
-        });
-        start = end;
-    }
-    if ranges.is_empty() {
-        staged.sentences = updated;
-    } else {
-        staged.sentences.splice(first..=last, updated);
-    }
-    staged.text = staged
-        .sentences
-        .iter()
-        .map(|sentence| sentence.text.as_str())
-        .collect();
-    staged.segments.clear();
-    if let Some(before) = pending_before {
-        crate::app::document::ssml::project(&before, &mut [&mut staged], Some(selection.clone()))?;
-    }
-    let mut cursor = boundaries[selection.start];
-    let mut incoming = Vec::new();
-    for fragment in inserted {
-        if let Some(pending) = &fragment.ssml {
-            incoming.push((cursor, pending));
-        }
-        cursor += fragment.text.len();
-    }
-    if !incoming.is_empty() {
-        crate::app::document::ssml::overlay(&mut staged, &incoming)?;
+    let mut staged = block.clone();
+    staged.sync_sentences()?;
+    let before = staged.clone();
+    staged.text.replace_range(
+        boundaries[selection.start]..boundaries[selection.end],
+        inserted,
+    );
+    if staged.text != before.text {
+        staged.sync_partition()?;
+        crate::app::document::ssml::project(&before, &mut [&mut staged], Some(selection))?;
+        staged.segments.clear();
     }
     staged.validate_sentences()?;
     Ok(staged)
+}
+
+fn signed_ranges(ranges: &[Option<Range<usize>>]) -> Result<Vec<Option<[i32; 2]>>, String> {
+    ranges
+        .iter()
+        .map(|range| {
+            range
+                .as_ref()
+                .map(|range| {
+                    Ok([
+                        i32::try_from(range.start).map_err(|_| "Word position exceeds int32")?,
+                        i32::try_from(range.end).map_err(|_| "Word position exceeds int32")?,
+                    ])
+                })
+                .transpose()
+        })
+        .collect()
 }

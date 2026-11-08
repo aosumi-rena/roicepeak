@@ -25,7 +25,6 @@ pub struct OutputTimings {
     pub device_samples: usize,
     pub resampled: bool,
     /// First active callback that consumed a source frame, including a silent frame.
-    /// Measures callback delivery, not microphone output.
     pub first_active_callback_after_load_seconds: Option<f64>,
     pub first_resume_after_load_seconds: Option<f64>,
     pub first_active_callback_after_resume_seconds: Option<f64>,

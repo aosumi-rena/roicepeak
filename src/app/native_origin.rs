@@ -1,6 +1,6 @@
 //! Immutable native document provenance shared by editor snapshots.
 use crate::app::native_project::NativeProject;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -146,7 +146,6 @@ impl NativeOrigin {
     }
 
     /// A moved whole sentence keeps its owner even when its current block changes.
-    /// Tokens are independent of reusable editor block/sentence IDs.
     pub fn validate_links(
         &self,
         blocks: impl IntoIterator<Item = Option<NativeOwner>>,
@@ -206,44 +205,6 @@ impl NativeOrigin {
     }
 }
 
-#[derive(Serialize)]
-struct Stored<'a> {
-    format: u32,
-    document: &'a str,
-}
-impl Serialize for NativeOrigin {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        Stored {
-            format: 1,
-            document: &self.0.document,
-        }
-        .serialize(serializer)
-    }
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Loaded {
-    format: u32,
-    document: String,
-}
-impl<'de> Deserialize<'de> for NativeOrigin {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let stored = Loaded::deserialize(deserializer)?;
-        if stored.format != 1 || stored.document.len() > MAX_NATIVE_BYTES {
-            return Err(de::Error::custom(
-                "Unsupported native origin format or size",
-            ));
-        }
-        let native = NativeProject::parse(stored.document.as_bytes()).map_err(de::Error::custom)?;
-        Self::new(native).map_err(de::Error::custom)
-    }
-}
-
-pub(crate) fn required_document<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<NativeOrigin>, D::Error> {
-    Option::<NativeOrigin>::deserialize(deserializer)
-}
 pub(crate) fn required_owner<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<NativeOwner>, D::Error> {

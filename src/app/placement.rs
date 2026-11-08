@@ -32,7 +32,6 @@ impl Planner {
     }
 
     /// Empty/unprepared blocks do not replace the preceding prepared block.
-    /// Sentence durations stay in model order, including their boundary silence.
     pub fn append(
         &mut self,
         block: &Block,
@@ -95,7 +94,6 @@ fn sample_index(seconds: f64, max_samples: usize) -> Result<usize, String> {
 }
 
 /// Mix in original block/sentence order using f32 addition.
-/// The separately truncated project duration clips the final sample.
 pub fn mix(output: &mut [f32], sample_start: usize, pcm: &[f32]) -> Result<(), String> {
     if sample_start > output.len() {
         return Err("Sentence starts outside the project audio buffer".into());

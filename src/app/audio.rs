@@ -219,8 +219,7 @@ impl Player {
         self.timing = Some(timing);
         result
     }
-    /// Returns the load report once, then the first consumed-frame update once if observed.
-    /// Call on the UI/control thread. The real-time callback only updates atomics.
+    /// Poll delivery updates on the control thread.
     pub fn poll_output_timing(&mut self) -> Option<OutputTimings> {
         self.timing.as_mut()?.poll()
     }

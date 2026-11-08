@@ -6,9 +6,7 @@ use crate::app::{
     dictionary::Entry,
     document::{Parameters, Segment, WordState},
 };
-use roicepeak::{
-    Error, Result as CoreResult, dnni, frontend::Tagger, manifest::Manifest, stylebook::Stylebook,
-};
+use roicepeak::{Error, Result as CoreResult, frontend::Tagger, manifest::Manifest};
 use std::{
     fs,
     io::Read,
@@ -66,7 +64,6 @@ pub(super) struct CachedVoice {
     pub(super) path: PathBuf,
     pub(super) stamp: Vec<Stamp>,
     pub(super) manifest: Manifest,
-    pub(super) style: Stylebook,
     charge: usize,
 }
 pub(super) struct VoiceLease {
@@ -201,7 +198,7 @@ impl Cache {
         let mut paths = resources.file_paths();
         paths.push(path.clone());
         for (path, expected) in &binding.metadata_files {
-            if read(path, 65_536)?.as_slice() != expected.as_slice() {
+            if read(path, expected.len())?.as_slice() != expected.as_slice() {
                 return Err(Error(
                     "Model metadata changed; reload the voice catalog".into(),
                 ));
@@ -239,11 +236,6 @@ impl Cache {
         }
         let resources = &binding.resources;
         let manifest = Manifest::from_resources(resources)?;
-        let style = Stylebook::compile(
-            &dnni::parse(&resources.stylebook)?,
-            resources.offsets.clone(),
-            resources.style_phonemes.clone(),
-        )?;
         if &stamps(paths, MAX_MODEL_BYTES)? != stamp
             || read(&path, 8 * 1024 * 1024)?.as_slice() != binding.source_bytes.as_slice()
         {
@@ -254,7 +246,6 @@ impl Cache {
             path: path.clone(),
             stamp: stamp.clone(),
             manifest,
-            style,
             charge: 0,
         };
         compiled.charge = compiled.estimated_bytes();

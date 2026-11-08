@@ -1,5 +1,4 @@
-//! Conservative retained charges; transient compilation/render buffers are separate.
-//! Shared allocations may be charged repeatedly. These estimates are not RSS.
+//! Conservative estimates of retained cache memory.
 use super::{Baseline, CachedVoice, Stamp};
 use crate::app::{
     dictionary::Entry,
@@ -132,7 +131,6 @@ impl CachedVoice {
             path(&self.path),
             stamps(&self.stamp),
             self.manifest.estimated_bytes(),
-            self.style.estimated_bytes(),
         ]))
     }
 }
@@ -165,6 +163,7 @@ impl Baseline {
             string(&self.word_query.text),
             string(&self.word_positions.source),
             vector(&self.word_positions.ranges),
+            vector(&self.word_positions.raw_ranges),
             sum(self.word_query.snapshots().into_iter().map(words)),
         ])
     }

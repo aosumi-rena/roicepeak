@@ -80,19 +80,8 @@ impl EditorApp {
         }
         .or_else(|| {
             rfd::FileDialog::new()
-                .add_filter(self.tr("", "ROICEPEAK project"), &["roicepeak"])
-                .add_filter("VOICEPEAK project", &["vpp"])
-                .set_file_name(
-                    if self
-                        .filename
-                        .as_deref()
-                        .is_some_and(crate::app::project_files::native)
-                    {
-                        "Untitled.vpp"
-                    } else {
-                        "Untitled.roicepeak"
-                    },
-                )
+                .add_filter(self.tr("", "VOICEPEAK project"), &["vpp"])
+                .set_file_name("Untitled.vpp")
                 .save_file()
         });
         if let Some(path) = path {
@@ -101,8 +90,7 @@ impl EditorApp {
     }
     pub fn open(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter(self.tr("", "ROICEPEAK project"), &["roicepeak", "json"])
-            .add_filter("VOICEPEAK project", &["vpp"])
+            .add_filter(self.tr("", "VOICEPEAK project"), &["vpp"])
             .pick_file()
         {
             self.open_path(path);
@@ -132,20 +120,11 @@ impl EditorApp {
     }
     pub(crate) fn import(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter(self.tr("", "UTF-8 text"), &["txt"])
+            .add_filter(self.tr("テキストファイル", "Text files"), &["txt"])
             .pick_file()
         {
             let result = (|| -> Result<_, String> {
-                use std::io::Read;
-                let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-                let mut bytes = Vec::new();
-                file.take(16 * 1024 * 1024 + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|e| e.to_string())?;
-                if bytes.len() > 16 * 1024 * 1024 {
-                    return Err("Text import exceeds 16 MiB".into());
-                }
-                let text = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+                let text = crate::app::imports::read_text(&path)?;
                 let room = 10_000usize.saturating_sub(self.project.blocks.len());
                 if text
                     .lines()
@@ -281,8 +260,10 @@ impl EditorApp {
                             ),
                         };
                         let mut display = value.percent();
-                        let response =
-                            crate::app::style::nonnegative(ui, popup == Popup::Volume, |ui| {
+                        let response = crate::app::style::nonnegative(
+                            ui,
+                            matches!(popup, Popup::Speed | Popup::Volume),
+                            |ui| {
                                 crate::app::style::parameter_row(
                                     ui,
                                     ("global-slider", popup as u8),
@@ -298,7 +279,8 @@ impl EditorApp {
                                     name,
                                     egui::Color32::from_rgb(95, 95, 102),
                                 )
-                            });
+                            },
+                        );
                         if response.changed() {
                             *value = crate::app::document::ControlValue::from_percent(display);
                         }

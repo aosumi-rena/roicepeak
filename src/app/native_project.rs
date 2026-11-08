@@ -89,8 +89,7 @@ impl NativeProject {
             value: object(value, "speech block")?,
         })
     }
-    /// Replace an existing raw numeric project field. Units and related flags are
-    /// the caller's responsibility; this does not generate missing native state.
+    /// Replace an existing numeric field without changing related flags.
     pub fn replace_existing_number(&mut self, pointer: &str, number: f64) -> Result<(), String> {
         if !pointer.starts_with("/project/") || pointer.len() > 4096 {
             return Err("Numeric edit must address an existing project field".into());
@@ -107,8 +106,7 @@ impl NativeProject {
         self.original = None;
         Ok(())
     }
-    /// Unchanged documents retain their exact original bytes. Edited documents
-    /// retain every JSON field, but whitespace and member ordering can change.
+    /// Preserve unchanged bytes and retain all JSON fields when editing.
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         let bytes = match &self.original {
             Some(bytes) => bytes.clone(),
@@ -194,8 +192,7 @@ impl<'a> NativeSentence<'a> {
     pub fn text(&self) -> Result<&'a str, String> {
         string(self.value, "text")
     }
-    /// Decode the linguistic tree while retaining durations, intonation, edit flags,
-    /// and token ranges in raw JSON. Missing engine tokens are not synthesized.
+    /// Decode words while retaining authored timing and token ranges.
     pub fn linguistic_tokens(&self) -> Result<NativeTokenTree, String> {
         use roicepeak::phonemes::{Phone, Syllable, Token};
         let native_tokens = array(self.value, "tokens")?;

@@ -43,6 +43,13 @@ fn main() {
 fn resource_compiler() -> PathBuf {
     println!("cargo:rerun-if-env-changed=WindowsSdkDir");
     println!("cargo:rerun-if-env-changed=WindowsSdkVerBinPath");
+    let host = env::var("HOST").expect("Build host is required");
+    let architecture = match host.split('-').next() {
+        Some("x86_64") => "x64",
+        Some("aarch64") => "arm64",
+        Some("i686") => "x86",
+        _ => panic!("Unsupported Windows SDK host architecture"),
+    };
     for directory in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
         let candidate = directory.join("rc.exe");
         if candidate.is_file() {
@@ -50,7 +57,7 @@ fn resource_compiler() -> PathBuf {
         }
     }
     if let Some(directory) = env::var_os("WindowsSdkVerBinPath") {
-        let candidate = PathBuf::from(directory).join("x64/rc.exe");
+        let candidate = PathBuf::from(directory).join(architecture).join("rc.exe");
         if candidate.is_file() {
             return candidate;
         }
@@ -65,11 +72,12 @@ fn resource_compiler() -> PathBuf {
         .expect("Windows SDK bin directory is required")
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.join("x64/rc.exe").is_file())
+        .filter(|path| path.join(architecture).join("rc.exe").is_file())
         .collect();
     versions.sort();
     versions
         .pop()
         .expect("Windows SDK rc.exe is required")
-        .join("x64/rc.exe")
+        .join(architecture)
+        .join("rc.exe")
 }

@@ -25,7 +25,7 @@ pub(super) fn replacement_sentence(sentence: &SentenceState) -> Result<Value, St
                 "Whitespace-only text cannot retain authored pronunciation controls".into(),
             );
         }
-        return Ok(json!({"text":sentence.text,"has-eos":true,"tokens":[]}));
+        return Ok(json!({"text":sentence.text,"has-eos":sentence.has_eos,"tokens":[]}));
     }
     words::replacement(sentence)
 }
@@ -40,7 +40,20 @@ fn block(block: &Block, config: &Config, emotions: &Value) -> Result<Value, Stri
         return Err("A new native document cannot contain retained native owners".into());
     }
     config.binding(&block.narrator)?;
-    let partition = sentences::partition(&block.text);
+    let partition = if !block.sentences.is_empty() {
+        if block
+            .sentences
+            .iter()
+            .map(|sentence| sentence.text.as_str())
+            .collect::<String>()
+            != block.text
+        {
+            return Err("Native Save requires complete prepared sentence boundaries".into());
+        }
+        block.sentence_ranges()
+    } else {
+        sentences::partition(&block.text)
+    };
     let list = if block.text.trim().is_empty() {
         if block.sentences.iter().any(|sentence| {
             sentence.ssml.is_some() || sentence.words.iter().any(|word| word.manual())
@@ -53,13 +66,21 @@ fn block(block: &Block, config: &Config, emotions: &Value) -> Result<Value, Stri
                 "Whitespace-only text cannot retain authored pronunciation controls".into(),
             );
         }
-        partition
-            .iter()
-            .map(|range| {
-                json!({"text":&block.text[range.bytes.clone()],
-            "has-eos":true,"tokens":[]})
-            })
-            .collect::<Vec<_>>()
+        if block.sentences.is_empty() {
+            partition
+                .iter()
+                .map(|range| {
+                    json!({"text":&block.text[range.bytes.clone()],
+                "has-eos":true,"tokens":[]})
+                })
+                .collect::<Vec<_>>()
+        } else {
+            block
+                .sentences
+                .iter()
+                .map(replacement_sentence)
+                .collect::<Result<Vec<_>, _>>()?
+        }
     } else {
         if partition.len() != block.sentences.len()
             || partition
@@ -74,7 +95,7 @@ fn block(block: &Block, config: &Config, emotions: &Value) -> Result<Value, Stri
         block
             .sentences
             .iter()
-            .map(words::sentence)
+            .map(new_sentence)
             .collect::<Result<Vec<_>, _>>()?
     };
     let ranges = partition

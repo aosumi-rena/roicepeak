@@ -396,9 +396,7 @@ pub fn pos_name(pos: u32) -> &'static str {
         .unwrap_or("補助記号")
 }
 
-/// Nine tab-separated columns: token index, text, language, POS, syllable index,
-/// reading, accent code, phone symbol, nucleus (0/1). Numeric fields are decimal.
-/// Repeated rows must agree on their token and syllable metadata.
+/// Parse nine-column token, syllable and phoneme records.
 pub fn parse_tsv(text: &str) -> Result<Vec<Token>> {
     if text.len() > 16 * 1024 * 1024 {
         return Err(invalid("token TSV exceeds byte budget"));

@@ -12,6 +12,7 @@ use std::{
 struct Unit {
     state: AtomicU8,
     pcm: OnceLock<Arc<Vec<f32>>>,
+    prefix: Mutex<Vec<f32>>,
 }
 
 pub struct Playback {
@@ -51,6 +52,7 @@ impl Playback {
             .map(|_| Unit {
                 state: AtomicU8::new(0),
                 pcm: OnceLock::new(),
+                prefix: Mutex::new(Vec::new()),
             })
             .collect();
         Ok(Arc::new(Self {
@@ -146,19 +148,79 @@ impl Playback {
         self.units[index].state.store(2, Ordering::Release);
         Some(index)
     }
+    pub(super) fn append(&self, index: usize, samples: &[f32]) -> Result<(), String> {
+        let planned = self
+            .plan
+            .units
+            .get(index)
+            .ok_or("Sentence PCM disagrees with its prepared playback plan")?;
+        let unit = &self.units[index];
+        let expected = (planned.duration * f64::from(SAMPLE_RATE)).round() as usize;
+        if samples.iter().any(|sample| !sample.is_finite()) {
+            return Err("Sentence PCM disagrees with its prepared playback plan".into());
+        }
+        if self.cancelled() {
+            return Ok(());
+        }
+        let mut prefix = unit
+            .prefix
+            .lock()
+            .map_err(|_| "Sentence PCM prefix unavailable")?;
+        if unit.pcm.get().is_some() {
+            return Err("Sentence PCM was published twice".into());
+        }
+        if prefix
+            .len()
+            .checked_add(samples.len())
+            .is_none_or(|length| length > expected)
+        {
+            return Err("Sentence PCM disagrees with its prepared playback plan".into());
+        }
+        if self.cancelled() {
+            return Ok(());
+        }
+        prefix.extend_from_slice(samples);
+        drop(prefix);
+        if !samples.is_empty() {
+            self.notify();
+        }
+        Ok(())
+    }
     pub(super) fn complete(&self, index: usize, pcm: Arc<Vec<f32>>) -> Result<(), String> {
-        let expected = (self.plan.units[index].duration * f64::from(SAMPLE_RATE)).round() as usize;
+        let planned = self
+            .plan
+            .units
+            .get(index)
+            .ok_or("Sentence PCM disagrees with its prepared playback plan")?;
+        let unit = &self.units[index];
+        let expected = (planned.duration * f64::from(SAMPLE_RATE)).round() as usize;
         if pcm.len() != expected || pcm.iter().any(|sample| !sample.is_finite()) {
             return Err("Sentence PCM disagrees with its prepared playback plan".into());
         }
         if self.cancelled() {
             return Ok(());
         }
-        self.units[index]
-            .pcm
+        let mut prefix = unit
+            .prefix
+            .lock()
+            .map_err(|_| "Sentence PCM prefix unavailable")?;
+        if prefix.len() > pcm.len()
+            || prefix
+                .iter()
+                .zip(pcm.iter())
+                .any(|(a, b)| a.to_bits() != b.to_bits())
+        {
+            return Err("Sentence PCM changed its published playback prefix".into());
+        }
+        if self.cancelled() {
+            return Ok(());
+        }
+        unit.pcm
             .set(pcm)
             .map_err(|_| "Sentence PCM was published twice")?;
-        self.units[index].state.store(3, Ordering::Release);
+        *prefix = Vec::new();
+        drop(prefix);
+        unit.state.store(3, Ordering::Release);
         let mut queue = self
             .queue
             .lock()
@@ -197,32 +259,42 @@ impl Playback {
             return Err("Playback source window is outside the project".into());
         }
         self.demand(start, end);
-        for (index, unit) in self.plan.units.iter().enumerate() {
-            let length = (unit.duration * f64::from(SAMPLE_RATE)).round() as usize;
-            if unit.sample_start < end
-                && unit.sample_start.saturating_add(length) > start
-                && self.units[index].pcm.get().is_none()
-            {
-                return Ok(None);
-            }
-        }
         let mut output = vec![0.0; end - start];
         for (index, unit) in self.plan.units.iter().enumerate() {
-            let Some(pcm) = self.units[index].pcm.get() else {
-                continue;
-            };
+            let length = (unit.duration * f64::from(SAMPLE_RATE)).round() as usize;
             let first = start.max(unit.sample_start);
-            let last = end.min(unit.sample_start.saturating_add(pcm.len()));
+            let last = end.min(unit.sample_start.saturating_add(length));
             if first >= last {
                 continue;
             }
-            for (destination, source) in output[first - start..last - start]
-                .iter_mut()
-                .zip(&pcm[first - unit.sample_start..last - unit.sample_start])
-            {
-                *destination += *source;
-                if !destination.is_finite() {
-                    return Err("Non-finite mixed playback sample".into());
+            let mut mix = |pcm: &[f32]| -> Result<(), String> {
+                for (destination, source) in output[first - start..last - start]
+                    .iter_mut()
+                    .zip(&pcm[first - unit.sample_start..last - unit.sample_start])
+                {
+                    *destination += *source;
+                    if !destination.is_finite() {
+                        return Err("Non-finite mixed playback sample".into());
+                    }
+                }
+                Ok(())
+            };
+            let storage = &self.units[index];
+            if let Some(pcm) = storage.pcm.get() {
+                mix(pcm)?;
+            } else {
+                let prefix = storage
+                    .prefix
+                    .lock()
+                    .map_err(|_| "Sentence PCM prefix unavailable")?;
+                if let Some(pcm) = storage.pcm.get() {
+                    drop(prefix);
+                    mix(pcm)?;
+                } else {
+                    if prefix.len() < last - unit.sample_start {
+                        return Ok(None);
+                    }
+                    mix(&prefix)?;
                 }
             }
         }

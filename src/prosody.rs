@@ -41,8 +41,7 @@ impl FeatureFormat {
             .map(|(code, _)| *code)
             .ok_or_else(|| invalid("missing prosody flag"))
     }
-    /// The stored format clears the half-open interval, including any interior slots.
-    /// Its highest flag can consequently survive recoding; this is deliberate.
+    /// Clear the stored half-open flag interval.
     pub fn recode(&self, input: &Tensor, codes: &[u32]) -> Result<Tensor> {
         if input.cols() < 3 || input.rows() != codes.len() {
             return Err(invalid("prosody recode dimensions"));
@@ -418,7 +417,6 @@ impl Prosody {
         )
     }
     /// False mask entries retain the supplied linguistic accent code.
-    /// The standalone reference omits application-level mask selection.
     pub fn run_with_prediction(
         &self,
         input: &Tensor,

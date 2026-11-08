@@ -173,9 +173,7 @@ fn native_japanese() -> &'static NativeCatalog {
 fn native_english() -> &'static NativeCatalog {
     NATIVE_ENGLISH.get_or_init(|| load_native("en-us-native.json"))
 }
-/// Narrator IDs are localization keys, not necessarily literal display names.
-/// Optional native packs stay local; custom locales use their own exact key or
-/// the English pack. Unmapped Japanese literal names are preserved as supplied.
+/// Resolve narrator display names through the selected locale.
 pub fn narrator_name(locale: Locale, key: &str) -> &str {
     if locale == Locale::Japanese {
         return native_japanese().exact.get(key).map_or(key, String::as_str);

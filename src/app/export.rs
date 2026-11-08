@@ -59,6 +59,10 @@ pub struct Settings {
     pub srt: bool,
     pub lab: bool,
     pub split: bool,
+    #[serde(default)]
+    pub selected_export: bool,
+    #[serde(default)]
+    pub name_rule: bool,
     pub parts: [NamePart; 3],
 }
 impl Default for Settings {
@@ -73,11 +77,19 @@ impl Default for Settings {
             srt: false,
             lab: false,
             split: false,
+            selected_export: false,
+            name_rule: false,
             parts: [NamePart::Number, NamePart::None, NamePart::None],
         }
     }
 }
 impl Settings {
+    fn for_scope(&self, scope: &Scope) -> Self {
+        let mut settings = self.clone();
+        settings.selected_export = matches!(scope, Scope::Blocks(_));
+        settings.name_rule = settings.split;
+        settings
+    }
     pub(crate) fn validate_stored(&self) -> Result<(), String> {
         if self.name.len() > 4096
             || self.name.contains('\0')
@@ -427,13 +439,13 @@ fn execute_at(
         }
     }
     check(cancel)?;
-    let _ = sender.send(Event::Accepted(settings.clone()));
+    let _ = sender.send(Event::Accepted(settings.for_scope(scope)));
     ctx.request_repaint();
     let mut worker = render::Worker::default();
     let nonempty = project
         .blocks
         .iter()
-        .any(|block| !block.text.trim().is_empty());
+        .any(|block| block.has_synthesis_units());
     let basis = if !nonempty {
         None
     } else if let Some(basis) =

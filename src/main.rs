@@ -2,8 +2,13 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod failure;
 mod platform;
 
 fn main() -> eframe::Result {
-    app::run()
+    let result = app::run();
+    if let Err(error) = &result {
+        failure::report(&error.to_string());
+    }
+    result
 }

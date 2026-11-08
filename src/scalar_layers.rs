@@ -1,5 +1,4 @@
-//! Normalized application controls composed in the native editor's operation order.
-//! Direct model and CLI parameters retain their existing calculations by default.
+//! Layered editor controls.
 use crate::{Result, invalid};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -27,7 +26,23 @@ impl ValuePolicy {
     }
 
     pub fn permits_nonnegative(self, value: f32, min: f32, max: f32) -> bool {
-        value >= 0.0 && self.permits(value, min, max)
+        let (lower, upper) = self.nonnegative_limits(min, max);
+        value.is_finite() && value >= lower && value <= upper
+    }
+
+    pub fn nonnegative_limits(self, min: f32, max: f32) -> (f32, f32) {
+        (
+            if self.allow_negative || self.allow_out_of_range {
+                0.0
+            } else {
+                min.max(0.0)
+            },
+            if self.allow_out_of_range {
+                max * 2.0
+            } else {
+                max
+            },
+        )
     }
 }
 
@@ -55,7 +70,7 @@ impl NormalizedScalars {
         if [self.speed, self.pitch, self.pause, self.volume]
             .iter()
             .any(|value| !value.is_finite())
-            || !policy.permits(self.speed, 0.5, 2.0)
+            || !policy.permits_nonnegative(self.speed, 0.5, 2.0)
             || !policy.permits(self.pitch, -1.5, 1.5)
             || !policy.permits(self.pause, 0.5, 2.0)
             || !policy.permits_nonnegative(self.volume, 0.0, 2.0)

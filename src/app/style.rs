@@ -198,6 +198,9 @@ fn slider_colored_mixed(
     mixed_label: &str,
     reframe_range: bool,
 ) -> Response {
+    if rect.width() < 21.0 || rect.height() < 2.0 {
+        return ui.interact(rect, ui.id().with(id), Sense::hover());
+    }
     #[derive(Clone, Copy)]
     struct Grab {
         value: f64,

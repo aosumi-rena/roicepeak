@@ -1,5 +1,4 @@
 //! Complete inference from explicit token trees, without automatic bank discovery.
-//! Text analysis is separate; the editor's observed default boundary policy is opt-in.
 #[path = "synthesis_query.rs"]
 mod query;
 pub use query::PreparedQuery;
@@ -15,10 +14,10 @@ use crate::{
     graph::Budget,
     invalid,
     language::{CharacterCache, LanguageModel},
-    modern::{AcousticDecoder, PitchModel},
+    modern::{AcousticDecoder, PitchModel, StyleLayout},
     phonemes::{Encoded, PhonemeEncoder, Token},
     prosody::{Prosody, logit},
-    sampling::{NormalStream, frame_noise, phoneme_seeds},
+    sampling::{frame_noise, phoneme_seeds},
     scalar_layers::ScalarLayers,
     stylebook::{Offsets, Style, Stylebook, speaker_vector, split_speakers},
     tensor::Tensor,
@@ -52,8 +51,7 @@ pub struct Edits {
     pub authored_duration: BTreeMap<usize, DurationEdit>,
     pub intonation_delta: BTreeMap<usize, f32>,
     pub boundary_silence: BoundarySilence,
-    /// Native normalized block/project/narrator controls. When set, scalar
-    /// Parameters must remain neutral; their boolean options still apply.
+    /// Layered controls require neutral scalar parameters.
     pub scalar_layers: Option<ScalarLayers>,
     pub value_policy: crate::scalar_layers::ValuePolicy,
 }
@@ -91,7 +89,7 @@ impl DurationEdit {
 pub enum BoundarySilence {
     #[default]
     Predicted,
-    /// Observed native editor constructor default, not a universal saved setting.
+    /// Default sentence boundary pauses.
     NativeEditorDefault,
 }
 impl Default for Parameters {
@@ -118,6 +116,7 @@ pub struct Synthesizer {
     acoustic: Acoustic,
     vocoder: Vocoder,
     stylebook: Stylebook,
+    style_layout: Option<StyleLayout>,
     speaker: usize,
     speaker_im: Vec<f32>,
     speaker_accent: Vec<f32>,
@@ -136,7 +135,6 @@ pub struct Render {
     pub raw_query_durations: Vec<f32>,
     pub raw_query_intonation: Vec<f32>,
     /// Interior query phones, before frame quantization, in encoded order.
-    /// Direct CLI post-frame duration scales are separate from query timing.
     pub phone_timing: Vec<PhoneTiming>,
     pub stages: BTreeMap<&'static str, Tensor>,
     pub timings: Option<RenderTimings>,
@@ -239,6 +237,21 @@ impl Synthesizer {
                 )?,
             )
         };
+        let style_layout = match &acoustic {
+            Acoustic::Legacy(_) => None,
+            Acoustic::Modern(pitch, decoder, _, _) => {
+                Some(StyleLayout::compile(models.acoustic, pitch, decoder)?)
+            }
+        };
+        let stylebook = match style_layout {
+            Some(layout) => Stylebook::compile_for_model(
+                models.stylebook,
+                offsets,
+                style_phones,
+                layout.channels(),
+            )?,
+            None => Stylebook::compile(models.stylebook, offsets, style_phones)?,
+        };
         Ok(Self {
             identity: Arc::new(()),
             prosody: Prosody::compile(models.intonation, models.accent, encoder.format.clone())?,
@@ -246,7 +259,8 @@ impl Synthesizer {
             lm: LanguageModel::compile(models.language)?,
             acoustic,
             vocoder: Vocoder::compile(models.vocoder)?,
-            stylebook: Stylebook::compile(models.stylebook, offsets, style_phones)?,
+            stylebook,
+            style_layout,
             speaker,
             speaker_im: vector(models.intonation)?,
             speaker_accent: vector(models.accent)?,
@@ -254,6 +268,17 @@ impl Synthesizer {
     }
     pub fn emotions(&self) -> &[String] {
         &self.stylebook.emotions
+    }
+
+    pub fn stylebook(&self) -> &Stylebook {
+        &self.stylebook
+    }
+
+    fn style_inputs<'a>(&self, embedding: &'a [f32]) -> Result<(&'a [f32], &'a [f32])> {
+        match self.style_layout {
+            Some(layout) => layout.split(embedding),
+            None => Ok((embedding, embedding)),
+        }
     }
     pub fn set_vocoder_effects(&mut self, effects: Effects) {
         self.vocoder.set_effects(effects);
@@ -307,8 +332,15 @@ impl Synthesizer {
         let scalars = self.validate_parameters(params, edits)?;
         let started = collect_timings.then(Instant::now);
         let prepared = self.prepare_query_impl(tokens, weights, edits, budget, collect_timings)?;
-        let mut rendered =
-            self.render_prepared_impl(&prepared, params, edits, budget, collect_timings, scalars)?;
+        let mut rendered = self.render_prepared_impl(
+            &prepared,
+            params,
+            edits,
+            budget,
+            collect_timings,
+            scalars,
+            None,
+        )?;
         if let (Some(timings), Some(query_timings), Some(started)) =
             (&mut rendered.timings, &prepared.timings, started)
         {
@@ -372,6 +404,7 @@ impl Synthesizer {
         budget: &mut Budget,
         collect_timings: bool,
         scalar_layers: Option<crate::scalar_layers::ResolvedScalars>,
+        emit: Option<&mut dyn FnMut(&[f32]) -> Result<()>>,
     ) -> Result<Render> {
         prepared.validate(self, edits)?;
         let started = collect_timings.then(Instant::now);
@@ -411,6 +444,7 @@ impl Synthesizer {
                 m.run(&features, &controls, &style.embedding, self.speaker, budget)?
             }
             Acoustic::Modern(pitch, decoder, pitch_speaker, decoder_speaker) => {
+                let (pitch_style, decoder_style) = self.style_inputs(&style.embedding)?;
                 let counts: Vec<_> = controls
                     .values()
                     .chunks_exact(3)
@@ -439,13 +473,13 @@ impl Synthesizer {
                     pitch.noise_channels(),
                     0.5,
                     seeds.as_deref(),
-                    &mut NormalStream::default(),
+                    &mut pitch.noise_stream(),
                     budget,
                 )?;
                 let f0 = pitch.run_with_speaker(
                     &pitch_input,
                     &controls,
-                    &style.embedding,
+                    pitch_style,
                     pitch_speaker,
                     Some(&noise),
                     budget,
@@ -455,14 +489,14 @@ impl Synthesizer {
                     decoder.noise_channels(),
                     0.75,
                     seeds.as_deref(),
-                    &mut NormalStream::default(),
+                    &mut decoder.noise_stream(),
                     budget,
                 )?;
                 let physical = decoder.run_with_speaker(
                     &x.linguistic,
                     &controls,
                     &f0,
-                    &style.embedding,
+                    decoder_style,
                     decoder_speaker,
                     Some(&noise),
                     budget,
@@ -471,41 +505,66 @@ impl Synthesizer {
                 physical
             }
         };
-        if let Some(bap) = style.aperiodicity {
-            for t in 0..physical.rows() {
-                for (v, offset) in physical.row_mut(t)[67..72].iter_mut().zip(bap) {
-                    *v = (*v + offset).clamp(0.0, 1.0);
-                }
+        let bap = style.aperiodicity.unwrap_or([0.0; 5]);
+        for t in 0..physical.rows() {
+            let row = physical.row_mut(t);
+            row[0] = row[0].clamp(0.0, 1.0);
+            row[2] = row[2].clamp(0.01, 3.0);
+            for (value, offset) in row[67..72].iter_mut().zip(bap) {
+                *value = (*value + offset).clamp(0.0, 1.0);
             }
         }
         let acoustic_elapsed = stage_elapsed();
-        let rendered = self
-            .vocoder
-            .run_with_tension(&physical, style.tension, budget)?;
-        let mut pcm = rendered
-            .stages
-            .get("pcm")
-            .ok_or_else(|| invalid("vocoder did not return PCM"))?
-            .clone();
-        if let Some(scalars) = scalar_layers {
+        let gain = if scalar_layers.is_some() {
             let gain = style.gain() as f32;
             if !gain.is_finite() {
                 return Err(invalid("style volume gain overflow"));
             }
-            for t in 0..pcm.rows() {
-                // Apply application gain after style gain, then store as float32.
-                let sample = pcm.row_mut(t);
-                sample[0] *= gain;
-                sample[0] = (f64::from(sample[0]) * scalars.volume_gain) as f32;
-            }
+            gain
         } else {
             let gain = style.gain() as f32 * (params.volume / 100.0);
             if !gain.is_finite() {
                 return Err(invalid("output volume gain overflow"));
             }
-            for t in 0..pcm.rows() {
-                pcm.row_mut(t)[0] *= gain;
+            gain
+        };
+        let scale = |sample: f32| -> Result<f32> {
+            let mut sample = sample * gain;
+            if let Some(scalars) = scalar_layers {
+                sample = (f64::from(sample) * scalars.volume_gain) as f32;
             }
+            if !sample.is_finite() {
+                return Err(invalid("non-finite inference result"));
+            }
+            Ok(sample)
+        };
+        let rendered = if let Some(emit) = emit {
+            let mut publish = |samples: &[f32]| -> Result<()> {
+                let scaled = samples
+                    .iter()
+                    .copied()
+                    .map(&scale)
+                    .collect::<Result<Vec<_>>>()?;
+                emit(&scaled)
+            };
+            self.vocoder.run_with_tension_streamed(
+                &physical,
+                style.tension,
+                budget,
+                &mut publish,
+            )?
+        } else {
+            self.vocoder
+                .run_with_tension(&physical, style.tension, budget)?
+        };
+        let mut pcm = rendered
+            .stages
+            .get("pcm")
+            .ok_or_else(|| invalid("vocoder did not return PCM"))?
+            .clone();
+        for t in 0..pcm.rows() {
+            let sample = &mut pcm.row_mut(t)[0];
+            *sample = scale(*sample)?;
         }
         pcm.ensure_finite()?;
         let vocoder_and_gain_elapsed = stage_elapsed();
@@ -596,7 +655,6 @@ fn prepare_controls(
     }
     if edits.boundary_silence == BoundarySilence::NativeEditorDefault {
         // Replace the leading duration after control edits, before acoustics.
-        // Only the qualified 5-ms model period is accepted.
         if period.to_bits() != 0.005f32.to_bits()
             || x.symbols.first().map(String::as_str) != Some("sil")
             || x.nucleus.first() != Some(&false)
@@ -610,8 +668,7 @@ fn prepare_controls(
         }
         let leading_seconds = f32::from_bits(0x3d4c_cccd);
         frames[0] = (f64::from(leading_seconds) / f64::from(period) + 0.5).floor() as f32;
-        // The query clock retains the original f32 boundary seconds, rather
-        // than reconstructing them from the rounded frame count.
+        // Keep boundary seconds independent of frame rounding.
         seconds[0] = leading_seconds;
     }
     let mut user = vec![0.5f32; slots];
@@ -627,8 +684,7 @@ fn prepare_controls(
     for (slot, value) in &edits.pitch {
         user[*slot] = *value;
     }
-    // Editor values are first written through the engine's clamped slot interface.
-    // Uncarried slots remain neutral when the application reconstructs its curve.
+    // Uncarried curve slots remain neutral.
     if !edits.pitch.is_empty() {
         for (i, r) in x.references.iter().enumerate() {
             if x.nucleus[i] {

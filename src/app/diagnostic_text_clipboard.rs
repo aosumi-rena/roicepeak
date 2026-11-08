@@ -1,9 +1,13 @@
-use crate::app::{document::Project, sentence_edit, text_clipboard::Payload};
+use crate::app::{
+    catalog::Catalog, project_files, render::Config, resources::Locations, sentence_edit,
+    text_clipboard::Payload,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::{
     ffi::OsString,
     io::{self, Read, Write},
+    path::PathBuf,
 };
 
 #[derive(Deserialize)]
@@ -16,7 +20,8 @@ struct Target {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
-    project: Project,
+    locations: PathBuf,
+    project: PathBuf,
     block: u64,
     selection: [usize; 2],
     #[serde(default)]
@@ -25,7 +30,7 @@ struct Input {
 
 pub(super) fn run(args: &[OsString]) -> Result<(), String> {
     if !args.is_empty() {
-        return Err("--inspect-text-clipboard accepts one JSON object on stdin".into());
+        return Err("--inspect-text-clipboard accepts a JSON object with locations and project .vpp paths on stdin".into());
     }
     let mut bytes = Vec::new();
     io::stdin()
@@ -36,10 +41,19 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
     if bytes.len() > 16 * 1024 * 1024 {
         return Err("Clipboard diagnostic input exceeds 16 MiB".into());
     }
-    let mut input: Input = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    input.project.validate()?;
-    let source = input
-        .project
+    let input: Input = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let locations = Locations::read(&input.locations)?;
+    let catalog = Catalog::load_roots(&locations.voice_roots)?;
+    let mut config = Config::from_catalog(
+        locations
+            .dictionary
+            .clone()
+            .ok_or("Explicit locations require a dictionary path")?,
+        &catalog,
+    )?;
+    config.value_policy = locations.value_policy();
+    let mut project = project_files::read(&input.project, Some(&config))?;
+    let source = project
         .blocks
         .iter()
         .find(|block| block.id == input.block)
@@ -57,14 +71,13 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
             return Err("Clipboard payload roundtrip differs".into());
         }
         if let Some(target) = input.paste {
-            let index = input
-                .project
+            let index = project
                 .blocks
                 .iter()
                 .position(|block| block.id == target.block)
                 .ok_or("Clipboard target block is absent")?;
-            let replacement = sentence_edit::replace(
-                &input.project.blocks[index],
+            let replacement = sentence_edit::replace_rich(
+                &project.blocks[index],
                 target.selection[0]..target.selection[1],
                 &decoded.sentences,
             )?;
@@ -73,13 +86,13 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
                     .checked_add(decoded.text().chars().count())
                     .ok_or("Clipboard caret overflow")?,
             );
-            input.project.blocks[index] = replacement;
-            input.project.validate()?;
-            updated = Some(input.project);
+            project.blocks[index] = replacement;
+            project.validate()?;
+            updated = Some(project.blocks[index].clone());
         }
     }
     let value = json!({"copied_text": payload.as_ref().map(Payload::text).unwrap_or_default(),
-        "payload": payload, "wire_bytes": wire_bytes, "updated_project": updated, "caret": caret});
+        "payload": payload, "wire_bytes": wire_bytes, "updated_block": updated, "caret": caret});
     let mut bytes = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
     io::stdout()

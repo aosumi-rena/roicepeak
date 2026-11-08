@@ -12,9 +12,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<String, String> {
     } else {
         let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
         std::str::from_utf8(bytes)
-            .map_err(
-                |_| "SRT encoding is not recognized; use UTF-8 or Unicode with a byte-order mark",
-            )?
+            .map_err(|_| "Unrecognized text encoding")?
             .to_owned()
     };
     check(&text)?;
@@ -23,7 +21,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<String, String> {
 
 fn utf16(bytes: &[u8], little: bool) -> Result<String, String> {
     if !bytes.len().is_multiple_of(2) {
-        return Err("Incomplete UTF-16 SRT character".into());
+        return Err("Incomplete UTF-16 character".into());
     }
     let words = bytes
         .chunks_exact(2)
@@ -36,12 +34,12 @@ fn utf16(bytes: &[u8], little: bool) -> Result<String, String> {
             }
         })
         .collect::<Vec<_>>();
-    String::from_utf16(&words).map_err(|_| "Invalid UTF-16 SRT character".into())
+    String::from_utf16(&words).map_err(|_| "Invalid UTF-16 character".into())
 }
 
 fn utf32(bytes: &[u8], little: bool) -> Result<String, String> {
     if !bytes.len().is_multiple_of(4) {
-        return Err("Incomplete UTF-32 SRT character".into());
+        return Err("Incomplete UTF-32 character".into());
     }
     bytes
         .chunks_exact(4)
@@ -52,7 +50,7 @@ fn utf32(bytes: &[u8], little: bool) -> Result<String, String> {
             } else {
                 u32::from_be_bytes(quad)
             };
-            char::from_u32(word).ok_or_else(|| "Invalid UTF-32 SRT character".to_owned())
+            char::from_u32(word).ok_or_else(|| "Invalid UTF-32 character".to_owned())
         })
         .collect()
 }

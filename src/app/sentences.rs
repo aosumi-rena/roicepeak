@@ -13,8 +13,7 @@ pub(crate) fn ends_with_delimiter(text: &str) -> bool {
         .any(|delimiter| text.ends_with(*delimiter))
 }
 
-/// A sentence address in the unnormalized block text. Token indices are local
-/// to this address; normalization does not imply token-to-source alignment.
+/// Sentence range in the original block text.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SentenceRef {
     pub index: usize,
@@ -22,8 +21,6 @@ pub struct SentenceRef {
     pub bytes: Range<usize>,
 }
 
-/// Keep a consecutive delimiter run in the preceding unit. The first following
-/// non-delimiter starts the next unit; leading delimiters may form a unit.
 pub fn partition(text: &str) -> Vec<SentenceRef> {
     let mut units = Vec::new();
     let (mut byte, mut character) = (0, 0);

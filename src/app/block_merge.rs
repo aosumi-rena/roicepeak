@@ -14,8 +14,7 @@ fn positions(sentence: &super::SentenceState) -> Vec<Option<std::ops::Range<usiz
 }
 
 impl Block {
-    /// Keep the left block's identity, voice, parameters and placement. Whole
-    /// sentences move intact; only an unterminated boundary sentence is joined.
+    /// Merge adjacent content while keeping the left block identity and settings.
     pub(crate) fn merged_with(&self, right: &Block) -> Result<Block, String> {
         self.text
             .len()
@@ -41,6 +40,8 @@ impl Block {
                 .ok_or("Merge boundary disappeared")?;
             let old_text = last.text.clone();
             let old_scalars = old_text.chars().count();
+            let mut raw_ranges = last.word_positions.stored_ranges(last.words.len())?;
+            raw_ranges.extend(first.word_positions.stored_ranges(first.words.len())?);
             let mut ranges = positions(last);
             ranges.extend(
                 positions(&first)
@@ -58,9 +59,9 @@ impl Block {
             last.word_positions = WordPositions {
                 source: last.text.clone(),
                 ranges,
+                raw_ranges,
             };
-            // These snapshots describe two prior query inputs. Keep the authored
-            // words, but do not expose either old query as the joined query.
+            // Keep authored words; discard both stale queries.
             last.query = WordQueryState::default();
         }
         let mut ids: BTreeSet<_> = merged
@@ -70,8 +71,7 @@ impl Block {
             .collect();
         let mut serial = merged.sentence_serial.max(right.sentence_serial);
         for sentence in &mut incoming {
-            // Native sentence identities are global; own identities are local to
-            // each block. Remap collisions without changing a surviving left ID.
+            // Remap sentence-ID collisions without changing the surviving left ID.
             if !ids.insert(sentence.id) {
                 serial = serial.checked_add(1).ok_or("Sentence identity exhausted")?;
                 sentence.id = serial;

@@ -36,6 +36,7 @@ pub struct Stylebook {
     rows: Vec<Vec<f32>>,
     offsets: Offsets,
     phonemes: Vec<String>,
+    embedding_channels: usize,
 }
 impl Stylebook {
     /// Retained heap charge, excluding the inline Stylebook itself.
@@ -53,6 +54,24 @@ impl Stylebook {
         root: &Node<'_>,
         offsets: Option<Offsets>,
         phonemes: Vec<String>,
+    ) -> Result<Self> {
+        Self::compile_with_channels(root, offsets, phonemes, None)
+    }
+
+    pub fn compile_for_model(
+        root: &Node<'_>,
+        offsets: Option<Offsets>,
+        phonemes: Vec<String>,
+        embedding_channels: usize,
+    ) -> Result<Self> {
+        Self::compile_with_channels(root, offsets, phonemes, Some(embedding_channels))
+    }
+
+    fn compile_with_channels(
+        root: &Node<'_>,
+        offsets: Option<Offsets>,
+        phonemes: Vec<String>,
+        embedding_channels: Option<usize>,
     ) -> Result<Self> {
         if !["_stbkv0", "_stbkv1"].contains(&root.tag.as_str()) {
             return Err(invalid("unsupported stylebook"));
@@ -93,6 +112,7 @@ impl Stylebook {
         if base.len() != width {
             return Err(invalid("stylebook base width"));
         }
+        let declared_offsets = offsets.is_some();
         let mut offsets = offsets.unwrap_or_default();
         for v in [
             &mut offsets.aperiodicity,
@@ -105,15 +125,16 @@ impl Stylebook {
                 *v = None;
             }
         }
-        if offsets.aperiodicity.is_none()
-            && offsets.volume.is_none()
-            && offsets.intonation.is_none()
-            && offsets.speed.is_none()
-            && offsets.tension.is_none()
-        {
-            offsets.aperiodicity = (width > 32).then_some(32);
-            offsets.volume = (width > 37).then_some(37);
-            offsets.intonation = (width > 38).then_some(38);
+        if !declared_offsets {
+            let channels = embedding_channels.unwrap_or(32);
+            offsets.aperiodicity = (width > channels).then_some(channels);
+            offsets.volume = (width > channels + 5).then_some(channels + 5);
+            offsets.intonation = (width > channels + 6).then_some(channels + 6);
+        }
+        let embedding_channels =
+            embedding_channels.unwrap_or_else(|| offsets.aperiodicity.unwrap_or(width));
+        if embedding_channels > width {
+            return Err(invalid("stylebook embedding outside row"));
         }
         let range = |start: Option<usize>, count: usize| {
             start.is_none_or(|s| s.checked_add(count).is_some_and(|end| end <= width))
@@ -132,6 +153,7 @@ impl Stylebook {
             rows: vectors,
             offsets,
             phonemes,
+            embedding_channels,
         })
     }
     pub fn vector(&self, weights: &[f32]) -> Result<Vec<f32>> {
@@ -158,9 +180,8 @@ impl Stylebook {
         let v = self.vector(weights)?;
         let o = &self.offsets;
         let scalar = |i: Option<usize>| i.map(|i| v[i]).unwrap_or(0.0);
-        let width = o.aperiodicity.unwrap_or(v.len());
         Ok(Style {
-            embedding: v[..width].to_vec(),
+            embedding: v[..self.embedding_channels].to_vec(),
             aperiodicity: o.aperiodicity.map(|i| v[i..i + 5].try_into().unwrap()),
             volume_db: scalar(o.volume),
             intonation: scalar(o.intonation),

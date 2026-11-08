@@ -1,11 +1,9 @@
-use crate::app::sentence_edit::{
-    Fragment, MAX_TEXT_BYTES, SourceSentence, ValidationBudget, WordPositions,
-};
+use crate::app::sentence_edit::{Fragment, MAX_TEXT_BYTES, SourceSentence, ValidationBudget};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
 pub(crate) const FORMAT_NAME: &str = "ROICEPEAK Sentence";
-const VERSION: u32 = 2;
+const VERSION: u32 = 4;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SENTENCES: usize = 10_000;
 #[cfg(windows)]
@@ -39,36 +37,13 @@ impl Payload {
         selection: Range<usize>,
     ) -> Result<Option<Self>, String> {
         let sentences = block.resolved_sentences()?;
-        let prepared: Vec<_> = sentences
-            .iter()
-            .map(|sentence| {
-                sentence.word_positions.source == sentence.text
-                    && sentence.word_positions.ranges.len() == sentence.words.len()
-            })
-            .collect();
-        let positions: Vec<_> = sentences
-            .iter()
-            .zip(&prepared)
-            .map(|(sentence, prepared)| {
-                if *prepared {
-                    sentence.word_positions.clone()
-                } else {
-                    WordPositions {
-                        source: sentence.text.clone(),
-                        ranges: Vec::new(),
-                    }
-                }
-            })
-            .collect();
         let sources = sentences
             .iter()
-            .zip(&positions)
-            .zip(&prepared)
-            .map(|((sentence, positions), prepared)| {
+            .map(|sentence| {
                 SourceSentence::new(
                     &sentence.text,
-                    if *prepared { &sentence.words } else { &[] },
-                    positions,
+                    &sentence.words,
+                    &sentence.word_positions,
                     sentence.ssml.as_ref(),
                 )
             })

@@ -153,17 +153,7 @@ pub(crate) fn decode(native: NativeProject, config: Option<&Config>) -> Result<P
             .map(|(k, n)| (k.clone(), ControlValue::from_normalized(n.value())))
             .collect();
         for (si, source) in source.sentences().iter().enumerate() {
-            if !source.has_eos {
-                return Err(format!(
-                    "/project/blocks/{index}/sentence-list/{si}: incomplete sentence query semantics are not qualified"
-                ));
-            }
             let mut sentence = source.state().clone();
-            if sentence.text.is_empty() {
-                return Err(
-                    "Empty native sentence nodes have no canonical sentence representation".into(),
-                );
-            }
             if sentence
                 .words
                 .iter()
@@ -190,6 +180,11 @@ pub(crate) fn decode(native: NativeProject, config: Option<&Config>) -> Result<P
             sentence.word_positions = crate::app::sentence_edit::WordPositions {
                 source: sentence.text.clone(),
                 ranges,
+                raw_ranges: source
+                    .word_ranges
+                    .iter()
+                    .map(|range| Some(range.r32))
+                    .collect(),
             };
             block.text.push_str(&sentence.text);
             block.sentence_serial = sentence.id;

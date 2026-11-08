@@ -87,8 +87,7 @@ impl Prepared {
         Ok(result)
     }
 
-    /// te, tp, ta, scale, wp, wp², alpha, epsilon, sine, A, B, c, e0,
-    /// opening exponent, remaining period, and negative epsilon times ta.
+    /// Coefficients for the LF source spectrum.
     pub fn words(&self) -> [f32; 16] {
         [
             self.te,

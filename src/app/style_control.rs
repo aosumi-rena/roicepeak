@@ -41,15 +41,16 @@ pub fn nonnegative<R>(
 }
 
 pub(super) fn limits(ui: &egui::Ui, min: f32, max: f32) -> (f32, f32) {
-    let (low, high) = policy(ui).limits(min / 100.0, max / 100.0);
     let nonnegative = ui.ctx().data(|data| {
         data.get_temp::<bool>(egui::Id::new("nonnegative-control"))
             .unwrap_or(false)
     });
-    (
-        if nonnegative { low.max(0.0) } else { low } * 100.0,
-        high * 100.0,
-    )
+    let (low, high) = if nonnegative {
+        policy(ui).nonnegative_limits(min / 100.0, max / 100.0)
+    } else {
+        policy(ui).limits(min / 100.0, max / 100.0)
+    };
+    (low * 100.0, high * 100.0)
 }
 
 #[derive(Clone, Default)]
@@ -260,8 +261,7 @@ fn parameter_row_impl(
                 ui.memory_mut(|memory| memory.surrender_focus(text_id));
             }
         }
-        // Editing the text draft is not an authored parameter change.
-        // Only a successful commit above reports the edit to bulk consumers.
+        // Report an authored change only after a successful commit.
     } else {
         let hovered = enabled && ui.rect_contains_pointer(rect);
         let text = if hovered {

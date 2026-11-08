@@ -106,10 +106,20 @@ pub(super) fn render(
             request.config.value_policy,
         )?;
         spec.weights = &weights;
-        spec.style_offset = voice.style.mix(&weights)?.intonation;
-        unit::perform(cache, &voice, &user, spec, profile, || {
-            checkpoint(shared, generation, JobKind::Playback)
-        })?
+        spec.style_offset = voice.manifest.synth.stylebook().mix(&weights)?.intonation;
+        let mut emit = |samples: &[f32]| {
+            checkpoint(shared, generation, JobKind::Playback)?;
+            session.append(unit_index, samples).map_err(Error)
+        };
+        unit::perform(
+            cache,
+            &voice,
+            &user,
+            spec,
+            profile,
+            || checkpoint(shared, generation, JobKind::Playback),
+            Some(&mut emit),
+        )?
     };
     checkpoint(shared, generation, JobKind::Playback)?;
     profile.cache_state(cache);

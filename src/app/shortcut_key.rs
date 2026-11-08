@@ -118,8 +118,7 @@ impl Chord {
         parts.join("+")
     }
 
-    /// Logical keys; `command` is egui's alias for Ctrl on Windows, so it is not
-    /// an extra independent modifier. mac_cmd remains explicit Super.
+    /// Logical modifiers with platform-specific Command handling.
     pub fn from_egui(key: egui::Key, modifiers: egui::Modifiers) -> Option<Self> {
         let key = match key {
             egui::Key::Colon => Key::Symbol(':'),

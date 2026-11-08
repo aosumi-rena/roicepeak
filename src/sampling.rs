@@ -1,4 +1,6 @@
 //! Explicit single-pass acoustic sampler and reproducible random inputs.
+mod pcg;
+
 use crate::{
     Result,
     dnni::Node,
@@ -94,11 +96,28 @@ impl Sampler {
     }
 }
 
-/// MT19937 plus float32 Marsaglia polar. Reseeding preserves the spare normal.
+#[derive(Clone, Copy)]
+pub(crate) enum NoiseKind {
+    Mt19937,
+    Pcg,
+}
+
+impl NoiseKind {
+    pub(crate) fn for_stage(tag: &str) -> Self {
+        if matches!(tag, "_ttsdf1" | "_ttsdt1") {
+            Self::Pcg
+        } else {
+            Self::Mt19937
+        }
+    }
+}
+
+/// MT19937 polar or PCG ziggurat normal noise.
 pub struct NormalStream {
     state: [u32; 624],
     index: usize,
     spare: Option<f32>,
+    pcg: Option<pcg::PcgNormal>,
 }
 impl Default for NormalStream {
     fn default() -> Self {
@@ -111,11 +130,27 @@ impl NormalStream {
             state: [0; 624],
             index: 624,
             spare: None,
+            pcg: None,
         };
         s.reseed(seed);
         s
     }
+    pub(crate) fn with_kind(kind: NoiseKind) -> Self {
+        match kind {
+            NoiseKind::Mt19937 => Self::default(),
+            NoiseKind::Pcg => Self {
+                state: [0; 624],
+                index: 624,
+                spare: None,
+                pcg: Some(pcg::PcgNormal::new(0)),
+            },
+        }
+    }
     pub fn reseed(&mut self, seed: u32) {
+        if let Some(pcg) = &mut self.pcg {
+            pcg.reseed(seed);
+            return;
+        }
         self.state[0] = seed;
         for i in 1..624 {
             let p = self.state[i - 1];
@@ -126,6 +161,9 @@ impl NormalStream {
         self.index = 624;
     }
     pub fn word(&mut self) -> u32 {
+        if let Some(pcg) = &mut self.pcg {
+            return pcg.word();
+        }
         if self.index == 624 {
             for i in 0..624 {
                 let y = (self.state[i] & 0x80000000) | (self.state[(i + 1) % 624] & 0x7fffffff);
@@ -144,6 +182,9 @@ impl NormalStream {
         y
     }
     pub fn normal(&mut self) -> f32 {
+        if let Some(pcg) = &mut self.pcg {
+            return pcg.normal();
+        }
         if let Some(value) = self.spare.take() {
             return value;
         }

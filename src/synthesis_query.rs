@@ -1,5 +1,4 @@
-//! Immutable per-sentence query preparation. Native text-change jobs prepare queries
-//! before Play; acoustic sampling and PCM creation remain a separate operation.
+//! Prepare reusable sentence queries before audio synthesis.
 use super::{Edits, Parameters, Render, RenderTimings, Synthesizer};
 use crate::{
     Result,
@@ -14,8 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Owned intermediate query tied to the compiled models that produced it.
-/// Scalar, duration, pitch and seed changes can reuse it; prediction/accent changes cannot.
+/// Prepared query belonging to its compiled models.
 pub struct PreparedQuery {
     pub(super) identity: Arc<()>,
     pub(super) encoded: Encoded,
@@ -119,7 +117,7 @@ impl Synthesizer {
         budget: &mut Budget,
     ) -> Result<Render> {
         let scalars = self.validate_parameters(params, edits)?;
-        self.render_prepared_impl(prepared, params, edits, budget, false, scalars)
+        self.render_prepared_impl(prepared, params, edits, budget, false, scalars, None)
     }
     /// Timings here describe newly performed controls/acoustic/vocoder work only.
     pub fn render_prepared_profiled(
@@ -130,7 +128,18 @@ impl Synthesizer {
         budget: &mut Budget,
     ) -> Result<Render> {
         let scalars = self.validate_parameters(params, edits)?;
-        self.render_prepared_impl(prepared, params, edits, budget, true, scalars)
+        self.render_prepared_impl(prepared, params, edits, budget, true, scalars, None)
+    }
+    pub fn render_prepared_profiled_streamed(
+        &self,
+        prepared: &PreparedQuery,
+        params: &Parameters,
+        edits: &Edits,
+        budget: &mut Budget,
+        emit: &mut dyn FnMut(&[f32]) -> Result<()>,
+    ) -> Result<Render> {
+        let scalars = self.validate_parameters(params, edits)?;
+        self.render_prepared_impl(prepared, params, edits, budget, true, scalars, Some(emit))
     }
     /// Apply current UI scalar/curve edits to query durations/intonation without audio inference.
     pub fn controls_prepared(
@@ -215,6 +224,7 @@ impl Synthesizer {
             })
             .transpose()?;
         let style = self.stylebook.mix(weights)?;
+        let (prosody_style, _) = self.style_inputs(&style.embedding)?;
         let predicted = self.prosody.run_with_prediction(
             &x.linguistic,
             &lm,
@@ -223,7 +233,7 @@ impl Synthesizer {
             edits.accent_codes.as_deref(),
             &self.speaker_im,
             &self.speaker_accent,
-            &style.embedding,
+            prosody_style,
             budget,
         )?;
         let period = match &self.acoustic {

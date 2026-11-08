@@ -38,8 +38,7 @@ pub struct VoiceBinding {
     pub metadata_files: Vec<(PathBuf, Vec<u8>)>,
     pub resources: ModelResources,
     pub main_emotion: Option<String>,
-    /// Metadata UI order and declared engine keys. Unmatched keys remain UI
-    /// controls without contributing synthesis weights.
+    /// Preserve control order; unmatched keys contribute no synthesis weight.
     pub emotion_bindings: Vec<EmotionBinding>,
 }
 #[derive(Clone, Debug, PartialEq)]

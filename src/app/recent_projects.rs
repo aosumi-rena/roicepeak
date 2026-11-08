@@ -55,7 +55,13 @@ impl RecentProjects {
                 return Err("Invalid recent project path".into());
             }
         }
-        Ok(Self { paths: saved.paths })
+        Ok(Self {
+            paths: saved
+                .paths
+                .into_iter()
+                .filter(|path| crate::app::project_files::native(path))
+                .collect(),
+        })
     }
 
     pub(crate) fn paths(&self) -> &[PathBuf] {
@@ -65,6 +71,9 @@ impl RecentProjects {
     pub(crate) fn record(&mut self, path: &Path) -> Result<(), String> {
         if !path.is_absolute() {
             return Err("Recent project path must be absolute".into());
+        }
+        if !crate::app::project_files::native(path) {
+            return Err("Select a VOICEPEAK project (*.vpp)".into());
         }
         if self
             .paths

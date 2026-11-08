@@ -13,6 +13,7 @@ mod dictionary;
 mod document;
 mod edit_history;
 mod editor;
+mod editor_settings;
 mod emotion_presets;
 mod experimental;
 mod export;
@@ -40,6 +41,7 @@ mod placement;
 mod portrait;
 mod preparation_ui;
 mod preset_store;
+mod project_drop;
 mod project_files;
 mod query_basis;
 mod recent_projects;
@@ -48,11 +50,15 @@ mod replace_voices;
 mod resource_settings;
 mod resources;
 mod root_tooltip;
+mod save_lexical;
+mod save_revision;
+mod save_worker;
 mod script_context;
 mod script_interactions;
 mod script_view;
 mod sentence_edit;
 mod sentences;
+mod settings;
 mod shortcut_dialog;
 mod shortcut_editor;
 mod shortcuts;
@@ -73,6 +79,7 @@ pub fn run() -> eframe::Result {
     if let native_cli::Dispatch::Exit(code) = native_cli::dispatch(&arguments) {
         std::process::exit(code);
     }
+    crate::failure::install();
     let mut gpu = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     #[cfg(windows)]
     {
@@ -83,11 +90,17 @@ pub fn run() -> eframe::Result {
     {
         gpu.instance_descriptor.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
     }
+    let locations = resources::Locations::load();
+    let viewport = eframe::egui::ViewportBuilder::default()
+        .with_icon(application_icon())
+        .with_drag_and_drop(true)
+        .with_min_inner_size([900.0, 600.0]);
+    let viewport = locations.as_ref().map_or_else(
+        |_| settings::Window::default().viewport(viewport.clone()),
+        |locations| locations.editor.window.viewport(viewport.clone()),
+    );
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_icon(application_icon())
-            .with_inner_size([1280.0, 768.0])
-            .with_min_inner_size([900.0, 600.0]),
+        viewport,
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(gpu),
@@ -98,9 +111,9 @@ pub fn run() -> eframe::Result {
     eframe::run_native(
         "ROICEPEAK",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             native_icons::install(&cc.egui_ctx);
-            Ok(Box::new(editor::EditorApp::new(cc)))
+            Ok(Box::new(editor::EditorApp::new(cc, locations)))
         }),
     )
 }

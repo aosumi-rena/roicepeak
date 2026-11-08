@@ -110,7 +110,7 @@ impl EditorApp {
             return Ok(());
         };
         let replacement = cut
-            .then(|| sentence_edit::replace(block, selection.clone(), &[]))
+            .then(|| sentence_edit::replace(block, selection.clone(), ""))
             .transpose()?;
         text_clipboard::write(ctx, &payload)?;
         if let Some(replacement) = replacement {
@@ -129,30 +129,43 @@ impl EditorApp {
         let (index, _, range) = self
             .focused_script_selection(ctx)
             .ok_or("Focus the block text editor first")?;
-        let fragments = if let Some(payload) = text_clipboard::read()? {
-            payload.sentences
-        } else if fallback.is_empty() {
-            return Ok(());
-        } else {
-            vec![Fragment {
-                text: fallback,
-                completes_sentence: false,
-                words: Vec::new(),
-                ssml: None,
-            }]
-        };
         let [first, last] = range.sorted_cursors();
         let selection = usize::from(first.index)..usize::from(last.index);
-        let added: usize = fragments
-            .iter()
-            .map(|fragment| fragment.text.chars().count())
-            .sum();
-        self.replace_script_text(ctx, index, selection.clone(), &fragments)?;
+        let added = if let Some(payload) = text_clipboard::read()? {
+            let added = payload.text().chars().count();
+            self.replace_script_rich_text(ctx, index, selection.clone(), &payload.sentences)?;
+            added
+        } else {
+            if fallback.is_empty() {
+                return Ok(());
+            }
+            self.replace_script_text(ctx, index, selection.clone(), &fallback)?;
+            fallback.chars().count()
+        };
         self.script_caret(ctx, index, selection.start + added);
         Ok(())
     }
 
     pub(crate) fn replace_script_text(
+        &mut self,
+        ctx: &egui::Context,
+        index: usize,
+        selection: Range<usize>,
+        inserted: &str,
+    ) -> Result<(), String> {
+        let block = self
+            .project
+            .blocks
+            .get(index)
+            .ok_or("Block is no longer present")?;
+        let replacement = sentence_edit::replace(block, selection.clone(), inserted)?;
+        self.begin_edit();
+        self.project.blocks[index] = replacement;
+        self.script_caret(ctx, index, selection.start);
+        Ok(())
+    }
+
+    pub(crate) fn replace_script_rich_text(
         &mut self,
         ctx: &egui::Context,
         index: usize,
@@ -164,7 +177,7 @@ impl EditorApp {
             .blocks
             .get(index)
             .ok_or("Block is no longer present")?;
-        let replacement = sentence_edit::replace(block, selection.clone(), fragments)?;
+        let replacement = sentence_edit::replace_rich(block, selection.clone(), fragments)?;
         self.begin_edit();
         self.project.blocks[index] = replacement;
         self.script_caret(ctx, index, selection.start);

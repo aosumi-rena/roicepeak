@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub use state::{SentenceState, WordState};
 #[path = "voice_ref.rs"]
 mod voice_ref;
-use std::{collections::BTreeMap, fs, io::Read, path::Path};
+use std::collections::BTreeMap;
 pub use voice_ref::{VoiceRef, VoiceVersion};
 pub(crate) use voice_ref::{VoiceSourceInfo, resolve_source};
 
@@ -105,11 +105,8 @@ impl Block {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Project {
-    pub format: u32,
-    #[serde(deserialize_with = "crate::app::native_origin::required_document")]
     pub(crate) native_origin: Option<crate::app::native_origin::NativeOrigin>,
     pub global: Parameters,
     pub narrator_settings: BTreeMap<String, Parameters>,
@@ -119,7 +116,6 @@ pub struct Project {
 impl Default for Project {
     fn default() -> Self {
         Self {
-            format: 12,
             native_origin: None,
             global: Parameters::default(),
             narrator_settings: BTreeMap::new(),
@@ -130,8 +126,7 @@ impl Default for Project {
 }
 impl Project {
     pub(crate) fn same_content(&self, other: &Self) -> bool {
-        self.format == other.format
-            && self.native_origin == other.native_origin
+        self.native_origin == other.native_origin
             && self.global == other.global
             && self.narrator_settings == other.narrator_settings
             && self.blocks == other.blocks
@@ -141,34 +136,6 @@ impl Project {
         (1..=used.len() as u64 + 1)
             .find(|id| !used.contains(id))
             .unwrap()
-    }
-    pub fn read(path: &Path) -> Result<Self, String> {
-        let mut bytes = Vec::new();
-        fs::File::open(path)
-            .map_err(|e| e.to_string())?
-            .take(16 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        if bytes.len() > 16 * 1024 * 1024 {
-            return Err("Project exceeds 16 MiB".into());
-        }
-        let project: Self = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        if project.format != 12 || project.blocks.len() > 10000 {
-            return Err("Unsupported project format or block count".into());
-        }
-        project.validate()?;
-        Ok(project)
-    }
-    pub fn write(&self, path: &Path) -> Result<(), String> {
-        let mut snapshot = self.clone();
-        snapshot.synchronize_sentences()?;
-        snapshot.validate()?;
-        let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|e| e.to_string())?;
-        if bytes.len() > 16 * 1024 * 1024 {
-            return Err("Project exceeds 16 MiB".into());
-        }
-        // The file chooser handles overwrite confirmation.
-        fs::write(path, bytes).map_err(|e| e.to_string())
     }
     pub fn validate(&self) -> Result<(), String> {
         self.export_settings.validate_stored()?;
@@ -187,8 +154,8 @@ impl Project {
             }
             None => (),
         }
-        if self.format != 12 || self.blocks.len() > 10000 {
-            return Err("Unsupported project format or block count".into());
+        if self.blocks.len() > 10000 {
+            return Err("Project exceeds 10,000 blocks".into());
         }
         let validate_parameters = |p: &Parameters| {
             if p.volume.normalized() < 0.0 {
@@ -256,7 +223,7 @@ impl Project {
         policy: roicepeak::scalar_layers::ValuePolicy,
     ) -> Result<(), String> {
         let parameters = |p: &Parameters, correction: bool| {
-            if !policy.permits(p.speed.normalized(), 0.5, 2.0)
+            if !policy.permits_nonnegative(p.speed.normalized(), 0.5, 2.0)
                 || !policy.permits(p.pitch.normalized(), -1.5, 1.5)
                 || !policy.permits(p.pause.normalized(), 0.5, 2.0)
                 || !policy.permits_nonnegative(p.volume.normalized(), 0.0, 2.0)
@@ -303,13 +270,10 @@ pub fn timestamp(seconds: f64) -> String {
 mod tests {
     use super::*;
     #[test]
-    fn project_round_trip_rejects_global_corruption_and_duplicate_ids() {
+    fn project_rejects_global_corruption_and_duplicate_ids() {
         let mut project = Project::default();
         project.import_text("第一行\nsecond line");
-        let bytes = serde_json::to_vec(&project).unwrap();
-        let decoded: Project = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(project, decoded);
-        assert!(decoded.validate().is_ok());
+        assert!(project.validate().is_ok());
         project.global.speed = ControlValue::from_normalized(f32::NAN);
         assert!(project.validate().is_err());
         project.global.speed = ControlValue::ONE;

@@ -3,8 +3,7 @@ use super::{Analysis, Word, accent, finish, morae, word};
 use crate::{Result, frontend::Tagger, invalid};
 use std::collections::BTreeMap;
 
-/// A validated pronunciation entry. This is not an installed/global user
-/// dictionary file and does not discover application preferences.
+/// Validated user pronunciation entry.
 pub struct Pronunciation {
     spelling: String,
     reading: String,
@@ -56,6 +55,7 @@ impl Pronunciation {
                 .collect(),
         );
         result.fixed = true;
+        result.authored_reading = true;
         Ok(result)
     }
 }
@@ -106,10 +106,7 @@ fn append(tagger: &Tagger, text: &str, base: usize, words: &mut Vec<Word>) -> Re
     Ok(())
 }
 
-/// Match explicit entries leftmost, longest at that position, before tagger
-/// analysis. `normalized` must already have passed `normalize` exactly once;
-/// entry spellings match that normalized text literally. Context around an
-/// explicit entry is tagged independently, as in the observed override path.
+/// Match normalized user entries leftmost and longest before analysis.
 pub fn analyze_text(
     tagger: &Tagger,
     normalized: &str,

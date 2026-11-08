@@ -70,8 +70,7 @@ fn vowel(c: char) -> Option<char> {
     None
 }
 
-/// Normalizes a pronunciation, not an orthographic sentence. Unsupported
-/// pronunciation characters are errors, so unknown text cannot disappear.
+/// Normalize pronunciation and reject unsupported characters.
 pub fn morae(pronunciation: &str) -> Result<Vec<String>> {
     if pronunciation.len() > 1_048_576 {
         return Err(invalid("Japanese pronunciation byte budget"));
@@ -123,8 +122,7 @@ pub fn morae(pronunciation: &str) -> Result<Vec<String>> {
     Ok(result)
 }
 
-/// Kana/phone correspondences are linguistic data. Regular rows are generated
-/// from their onset and vowel; contracted and foreign morae are explicit.
+/// Generate regular morae and list irregular readings explicitly.
 fn symbols(mora: &str) -> Option<String> {
     for (onset, row) in [
         ("", "アイウエオ"),

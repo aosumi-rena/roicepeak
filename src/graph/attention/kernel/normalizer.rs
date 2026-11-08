@@ -108,7 +108,6 @@ unsafe fn sse(width: usize, source: *const f32, target: *mut f32) {
     }
 }
 
-// The two AVX leaves differ only in the two polynomial multiply/add operations.
 macro_rules! avx_body {
     ($width:ident, $source:ident, $target:ident, $fused:literal) => {{
         let blocks = $width.div_ceil(8);

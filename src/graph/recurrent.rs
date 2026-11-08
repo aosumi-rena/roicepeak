@@ -16,6 +16,30 @@ pub struct Gru {
     inputs: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub(super) enum Stage {
+    OldHidden = 0,
+    ResetSeed = 1,
+    ResetInputAdded = 2,
+    ResetRecurrentAdded = 3,
+    ResetActivated = 4,
+    UpdateSeed = 5,
+    UpdateInputAdded = 6,
+    UpdateRecurrentAdded = 7,
+    UpdateActivated = 8,
+    CandidateSeed = 9,
+    CandidateRecurrentAdded = 10,
+    CandidateResetMultiplied = 11,
+    CandidateInputAdded = 12,
+    CandidateInputBiasAdded = 13,
+    CandidateActivated = 14,
+    HiddenMultipliedUpdate = 15,
+    UpdateComplemented = 16,
+    CandidateWeightedComplement = 17,
+    NewHidden = 18,
+}
+
 impl Gru {
     pub fn estimated_bytes(&self) -> usize {
         crate::memory::sum([
@@ -106,6 +130,16 @@ impl Gru {
         state: &mut [f32],
         budget: &mut Budget,
     ) -> Result<Tensor> {
+        self.run_state_observed(input, reverse, state, budget, |_, _, _| Ok(()))
+    }
+    pub(super) fn run_state_observed(
+        &self,
+        input: &Tensor,
+        reverse: bool,
+        state: &mut [f32],
+        budget: &mut Budget,
+        mut observe: impl FnMut(usize, Stage, &[f32]) -> Result<()>,
+    ) -> Result<Tensor> {
         if input.cols() != self.inputs {
             return Err(invalid("GRU input dimension"));
         }
@@ -162,42 +196,61 @@ impl Gru {
                 step
             };
             let source = input.row(time);
+            observe(time, Stage::OldHidden, &hidden)?;
             reset.copy_from_slice(&self.reset_bias);
+            observe(time, Stage::ResetSeed, &reset)?;
             self.matrices[0].product_into(source, &mut reset, add, &mut workspace)?;
+            observe(time, Stage::ResetInputAdded, &reset)?;
             self.matrices[3].product_into(&hidden, &mut reset, add, &mut workspace)?;
+            observe(time, Stage::ResetRecurrentAdded, &reset)?;
             self.sigmoid.apply_in_place(&mut reset)?;
+            observe(time, Stage::ResetActivated, &reset)?;
 
             update.copy_from_slice(&self.update_bias);
+            observe(time, Stage::UpdateSeed, &update)?;
             self.matrices[1].product_into(source, &mut update, add, &mut workspace)?;
+            observe(time, Stage::UpdateInputAdded, &update)?;
             self.matrices[4].product_into(&hidden, &mut update, add, &mut workspace)?;
+            observe(time, Stage::UpdateRecurrentAdded, &update)?;
             self.sigmoid.apply_in_place(&mut update)?;
+            observe(time, Stage::UpdateActivated, &update)?;
 
             candidate.copy_from_slice(&self.biases[5]);
+            observe(time, Stage::CandidateSeed, &candidate)?;
             self.matrices[5].product_into(&hidden, &mut candidate, add, &mut workspace)?;
+            observe(time, Stage::CandidateRecurrentAdded, &candidate)?;
             for (value, reset) in candidate.iter_mut().zip(&reset) {
                 *value = *reset * *value;
             }
+            observe(time, Stage::CandidateResetMultiplied, &candidate)?;
             self.matrices[2].product_into(source, &mut candidate, add, &mut workspace)?;
+            observe(time, Stage::CandidateInputAdded, &candidate)?;
             for (value, bias) in candidate.iter_mut().zip(&self.biases[2]) {
                 *value = *bias + *value;
             }
+            observe(time, Stage::CandidateInputBiasAdded, &candidate)?;
             self.tanh.apply_in_place(&mut candidate)?;
+            observe(time, Stage::CandidateActivated, &candidate)?;
 
             for (hidden, update) in hidden.iter_mut().zip(&update) {
                 *hidden = *update * *hidden;
             }
+            observe(time, Stage::HiddenMultipliedUpdate, &hidden)?;
             for value in &mut update {
                 *value = 1.0 - *value;
             }
+            observe(time, Stage::UpdateComplemented, &update)?;
             for (candidate, update) in candidate.iter_mut().zip(&update) {
                 *candidate = *update * *candidate;
             }
+            observe(time, Stage::CandidateWeightedComplement, &candidate)?;
             for (hidden, candidate) in hidden.iter_mut().zip(&candidate) {
                 *hidden = *candidate + *hidden;
             }
             if hidden.iter().any(|v| !v.is_finite()) {
                 return Err(invalid("nonfinite retained GRU hidden state"));
             }
+            observe(time, Stage::NewHidden, &hidden)?;
             output.row_mut(time).copy_from_slice(&hidden);
         }
         output.ensure_finite()?;

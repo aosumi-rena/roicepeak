@@ -1,7 +1,6 @@
 //! Float32 scaled exponential used when converting log-amplitude responses.
 
-/// Compute `exp(value) * scale` with the reference scalar operation order.
-/// Both inputs must be finite. Signed zero and gradual underflow are retained.
+/// Evaluate scaled exponentials while preserving signed zero and underflow.
 pub(super) fn scaled_exp(value: f32, scale: f32) -> f32 {
     debug_assert!(value.is_finite() && scale.is_finite());
     if scale == 0.0 {
@@ -33,8 +32,7 @@ pub(super) fn scaled_exp(value: f32, scale: f32) -> f32 {
     scale_binary(fraction, exponent)
 }
 
-// Changing an IEEE exponent is exact until the result becomes subnormal. The
-// final shift then rounds to nearest, ties to even, without double rounding.
+// Round subnormal results once, to nearest with ties to even.
 fn scale_binary(value: f32, power: i32) -> f32 {
     let bits = value.to_bits();
     let sign = bits & 0x80000000;
