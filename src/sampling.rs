@@ -1,5 +1,6 @@
 //! Explicit single-pass acoustic sampler and reproducible random inputs.
 mod pcg;
+pub(crate) mod streaming;
 
 use crate::{
     Result,
@@ -20,6 +21,10 @@ pub struct Sampler {
     output: Graph,
 }
 impl Sampler {
+    pub(crate) fn stream(&self, shape: f32, offset: f32) -> Result<streaming::Stream<'_>> {
+        streaming::Stream::new(self, shape, offset)
+    }
+
     pub fn estimated_bytes(&self) -> usize {
         crate::memory::sum([
             self.input.estimated_bytes(),

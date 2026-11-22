@@ -1,3 +1,5 @@
+#[path = "inspector_language.rs"]
+mod language;
 #[path = "inspector_version.rs"]
 mod version;
 use crate::app::{
@@ -5,6 +7,7 @@ use crate::app::{
     style::{self, Icon},
 };
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
+const LANGUAGE_ROW: f32 = 39.0;
 
 impl EditorApp {
     pub(crate) fn inspector_rect(&self, body: Rect) -> Rect {
@@ -20,7 +23,7 @@ impl EditorApp {
             ),
             Vec2::new(
                 260.0,
-                466.0 + self.selected_emotion_controls().len() as f32 * 39.0,
+                466.0 + LANGUAGE_ROW + self.selected_emotion_controls().len() as f32 * 39.0,
             ),
         )
     }
@@ -162,11 +165,28 @@ impl EditorApp {
                 self.begin_edit();
                 for index in changed {
                     let block = &mut self.project.blocks[index];
-                    block.narrator.version = version;
-                    block.segments.clear();
+                    let mut narrator = block.narrator.clone();
+                    narrator.version = version;
+                    self.catalog.select_available_language(&mut narrator);
+                    block.set_narrator(narrator);
                 }
             }
         }
+        style::label(
+            ui,
+            rect.min + Vec2::new(16.0, 147.5 + LANGUAGE_ROW),
+            self.tr("言語", "Language"),
+            14.0,
+            style::TEXT,
+        );
+        language::show(
+            self,
+            ui,
+            version_rect.translate(Vec2::new(0.0, LANGUAGE_ROW)),
+            &selected,
+            block_id,
+        );
+        let rect = rect.translate(Vec2::new(0.0, LANGUAGE_ROW));
         divider(ui, rect.top() + 175.0);
         style::label(
             ui,
@@ -250,7 +270,7 @@ impl EditorApp {
                     .iter()
                     .any(|&index| read(&self.project.blocks[index].parameters) != authored)
             {
-                self.begin_edit();
+                self.begin_parameter_edit();
                 for &index in &selected {
                     let parameters = &mut self.project.blocks[index].parameters;
                     match field {

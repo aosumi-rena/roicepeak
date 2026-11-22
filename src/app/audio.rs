@@ -1,6 +1,8 @@
 //! Output-only playback. Rendering samples stay unchanged; device conversion is separate.
 #[path = "audio_stream.rs"]
 mod live;
+#[path = "audio_resample.rs"]
+mod resampling;
 #[path = "audio_timing.rs"]
 mod timing;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -62,6 +64,15 @@ impl Default for Player {
         }
     }
 }
+pub(super) fn seek_sample(seconds: f64, rate: u32, length: usize, round_up: bool) -> usize {
+    if !seconds.is_finite() {
+        return 0;
+    }
+    let position = seconds.max(0.0) * f64::from(rate);
+    let position = if round_up { position.ceil() } else { position };
+    (position as usize).min(length)
+}
+
 impl Player {
     pub fn stop(&mut self) {
         self.pause();
@@ -103,16 +114,20 @@ impl Player {
         }
     }
     pub fn seek(&self, seconds: f64) {
+        self.seek_position(seconds, false);
+    }
+
+    pub(super) fn seek_at_or_after(&self, seconds: f64) {
+        self.seek_position(seconds, true);
+    }
+
+    fn seek_position(&self, seconds: f64, round_up: bool) {
         if let Some(live) = &self.live {
-            live.seek(seconds);
+            live.seek(seconds, round_up);
             return;
         }
         self.cursor.store(
-            if seconds.is_finite() {
-                ((seconds.max(0.0) * self.rate as f64) as usize).min(self.len)
-            } else {
-                0
-            },
+            seek_sample(seconds, self.rate, self.len, round_up),
             Ordering::Relaxed,
         );
     }
@@ -371,7 +386,7 @@ impl Player {
             .map_err(|e| e.to_string())
     }
 }
-/// Windowed-sinc conversion for playback only. Raw synthesis/export uses 48 kHz samples.
+/// Convert synthesized samples to the selected device or export rate.
 pub(crate) fn resample(input: &[f32], source: u32, target: u32) -> Result<Vec<f32>, String> {
     if source == 0 || target == 0 {
         return Err("Invalid audio sample rate".into());
@@ -381,37 +396,7 @@ pub(crate) fn resample(input: &[f32], source: u32, target: u32) -> Result<Vec<f3
     if length > 48_000 * 60 * 60 {
         return Err("Playback resampling limit".into());
     }
-    let ratio = source as f64 / target as f64;
-    let cutoff = (target as f64 / source as f64).min(1.0) * 0.95;
-    let mut out = Vec::with_capacity(length);
-    for i in 0..length {
-        let at = i as f64 * ratio;
-        let center = at.floor() as i64;
-        let mut sum = 0.0;
-        let mut weight = 0.0;
-        for j in center - 31..=center + 32 {
-            let delta = at - j as f64;
-            let window = 0.42
-                + 0.5 * (std::f64::consts::PI * delta / 32.0).cos()
-                + 0.08 * (std::f64::consts::TAU * delta / 32.0).cos();
-            let z = std::f64::consts::PI * cutoff * delta;
-            let w = if z.abs() < 1e-12 {
-                cutoff
-            } else {
-                cutoff * z.sin() / z
-            } * window;
-            if j >= 0 && (j as usize) < input.len() {
-                sum += input[j as usize] as f64 * w;
-                weight += w;
-            }
-        }
-        out.push(if weight.abs() > 1e-12 {
-            (sum / weight) as f32
-        } else {
-            0.0
-        });
-    }
-    Ok(out)
+    Ok(resampling::Sinc::new(source, target).window(input, 0, 0, length))
 }
 #[cfg(test)]
 mod tests {

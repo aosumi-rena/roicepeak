@@ -37,6 +37,29 @@ unsafe fn product_avx(
     use std::arch::x86_64::*;
 
     let mut channel = 0;
+    if output.len().is_multiple_of(64) {
+        while channel + 64 <= output.len() {
+            let destination = unsafe { output.as_mut_ptr().add(channel) };
+            let mut sums = [_mm256_setzero_ps(); 8];
+            if add {
+                for (lane, sum) in sums.iter_mut().enumerate() {
+                    *sum = unsafe { _mm256_loadu_ps(destination.add(lane * 8)) };
+                }
+            }
+            for (i, &value) in input.iter().enumerate() {
+                let source = unsafe { coefficients.as_ptr().add(i * stride + channel) };
+                let x = _mm256_set1_ps(value);
+                for (lane, sum) in sums.iter_mut().enumerate() {
+                    let coefficient = unsafe { _mm256_loadu_ps(source.add(lane * 8)) };
+                    *sum = _mm256_fmadd_ps(coefficient, x, *sum);
+                }
+            }
+            for (lane, sum) in sums.into_iter().enumerate() {
+                unsafe { _mm256_storeu_ps(destination.add(lane * 8), sum) };
+            }
+            channel += 64;
+        }
+    }
     while channel + 32 <= output.len() {
         let destination = unsafe { output.as_mut_ptr().add(channel) };
         let mut a = _mm256_setzero_ps();

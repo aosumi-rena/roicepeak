@@ -42,7 +42,7 @@ impl EditorApp {
             let mut resources = self.resources.clone();
             resources.allow_out_of_range = extended;
             resources.allow_negative = negative;
-            match resources.save() {
+            match self.settings_state.save_now(&resources) {
                 Ok(()) => {
                     self.query_basis_current = false;
                     self.resources = resources;

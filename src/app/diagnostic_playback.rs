@@ -15,17 +15,30 @@ pub(super) fn render(
     project: Project,
     user_dictionary: crate::app::dictionary::Snapshot,
     output: &Path,
+    prepare_first: bool,
 ) -> Result<(), String> {
     let mut worker = Worker::default();
     let started = Instant::now();
-    worker.start_playback(
-        Request {
-            config: config.clone(),
-            project: project.clone(),
-            user_dictionary: user_dictionary.clone(),
-        },
-        0.0,
-    )?;
+    let request = Request {
+        config: config.clone(),
+        project: project.clone(),
+        user_dictionary: user_dictionary.clone(),
+    };
+    let preparation_running = if prepare_first {
+        worker.prepare(request.clone())?;
+        super::wait(|| {
+            if worker.preparation_running() {
+                Some(Ok(true))
+            } else if !worker.preparing() {
+                Some(Ok(false))
+            } else {
+                None
+            }
+        })?
+    } else {
+        false
+    };
+    worker.start_playback(request, 0.0, None)?;
     let source = super::wait(|| worker.poll_playback())?;
     let plan_seconds = started.elapsed().as_secs_f64();
     let first_end = source.plan.samples.min(128);
@@ -78,6 +91,7 @@ pub(super) fn render(
             "samples":tensor.rows(), "units":source.total_units(),
             "ready_units_at_first_read":first_ready, "first_read_samples":first_end,
             "preparation_seconds":plan_seconds, "first_read_seconds":first_seconds,
+            "background_preparation_running_at_play":preparation_running,
             "progressive_completion_seconds":progressive_seconds,
             "whole_sentence_inference":true, "device_stream_opened":false,
             "same_length_as_eager":same_length, "different_pcm_words":differences,

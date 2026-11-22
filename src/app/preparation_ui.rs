@@ -60,11 +60,21 @@ impl EditorApp {
                 // Rebind only after the authoritative application accepted this snapshot.
                 let mut result = result;
                 result.source = updated.clone();
+                if self.playback.is_none() && self.rendered_audio.is_empty() {
+                    self.playback_guide.replace(&result.blocks);
+                    if self.transport == crate::app::transport::Transport::Stopped
+                        && let Some(previous) = self.project.blocks.first()
+                        && let Some(first) = updated.blocks.first()
+                        && self.selection.current() == Some(first.id)
+                        && self.playhead == previous.timestamp
+                    {
+                        self.playhead = first.timestamp;
+                    }
+                    self.retime_control_seek();
+                }
                 if let Err(error) = self.export.remember_preparation(result) {
                     self.render_status = error;
                 }
-                // Apply derived metadata before recording history.
-                self.dirty |= self.project != updated;
                 self.project = updated;
                 self.query_basis_current = true;
             }

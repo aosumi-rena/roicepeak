@@ -125,6 +125,7 @@ ROICEPEAK uses the following libraries and assets:
 - peniko 0.6.1
 - pico-args 0.5.0
 - pin-project-lite 0.2.17
+- pinyin 0.11.0
 - pkg-config 0.3.34
 - png 0.17.16
 - png 0.18.1
@@ -223,6 +224,8 @@ ROICEPEAK uses the following libraries and assets:
 - zune-core 0.5.3
 - zune-jpeg 0.5.15
 - Unicode Character Database 13.0.0
+- Carnegie Mellon Pronouncing Dictionary 74790861
+- pinyin-pro phrase readings 0785234b
 - Noto Sans CJK JP Regular
 - Visby Round CF Bold (wordmark artwork)
 
@@ -24348,6 +24351,38 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
+## pinyin 0.11.0
+
+Declared license: MIT
+
+Package authors: mozillazg <mozillazg101@gmail.com>; Xidorn Quan <me@upsuper.org>
+
+Source file: `LICENSE`
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2016 mozillazg
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## pkg-config 0.3.34
 
 Declared license: MIT OR Apache-2.0
@@ -44361,6 +44396,82 @@ authorization of the copyright holder.
 ```
 
 Exact upstream legal-text source: https://www.unicode.org/license.txt
+
+## Carnegie Mellon Pronouncing Dictionary 74790861
+
+Declared license: BSD-2-Clause
+
+Source file: `assets/CMUdict-LICENSE.txt`
+
+```text
+Copyright (C) 1993-2015 Carnegie Mellon University. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+   The contents of this file are deemed to be source code.
+
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in
+   the documentation and/or other materials provided with the
+   distribution.
+
+This work was supported in part by funding from the Defense Advanced
+Research Projects Agency, the Office of Naval Research and the National
+Science Foundation of the United States of America, and by member
+companies of the Carnegie Mellon Sphinx Speech Consortium. We acknowledge
+the contributions of many volunteers to the expansion and improvement of
+this dictionary.
+
+THIS SOFTWARE IS PROVIDED BY CARNEGIE MELLON UNIVERSITY ``AS IS'' AND
+ANY EXPRESSED OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL CARNEGIE MELLON UNIVERSITY
+NOR ITS EMPLOYEES BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+Exact upstream legal-text source: https://raw.githubusercontent.com/cmusphinx/cmudict/74790861f652b15e4ac49015a90074ad62a27690/LICENSE
+
+## pinyin-pro phrase readings 0785234b
+
+Declared license: MIT
+
+Source file: `assets/PinyinPro-LICENSE.txt`
+
+```text
+MIT License
+
+Copyright (c) 2022-present zh-lx
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+Exact upstream legal-text source: https://raw.githubusercontent.com/zh-lx/pinyin-pro/0785234b4dc0fa3ea9f244e3d77703b2df6a9db4/LICENSE
 
 ## Noto Sans CJK JP Regular
 

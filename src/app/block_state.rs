@@ -2,12 +2,40 @@
 use super::{Block, Project, SentenceState, WordState, alignment, state};
 use crate::app::sentences::{self, SentenceRef};
 impl Block {
+    pub(crate) fn set_narrator(&mut self, narrator: super::VoiceRef) {
+        if self.narrator.language != narrator.language {
+            if !self.sentences.is_empty()
+                && self.sentences.iter().all(|sentence| {
+                    sentence.native_owner.is_none() && sentence.ssml.is_none() && sentence.has_eos
+                })
+            {
+                let ranges = sentences::partition_for_language(&self.text, &self.narrator.language);
+                if ranges
+                    .iter()
+                    .map(|range| &self.text[range.bytes.clone()])
+                    .eq(self.sentences.iter().map(|sentence| sentence.text.as_str()))
+                    && ranges != sentences::partition_for_language(&self.text, &narrator.language)
+                {
+                    self.sentences.clear();
+                }
+            }
+            for sentence in &mut self.sentences {
+                sentence.words.clear();
+                sentence.word_positions = Default::default();
+                sentence.query = Default::default();
+            }
+        }
+        self.narrator = narrator;
+        self.segments.clear();
+    }
+
     pub(crate) fn has_synthesis_units(&self) -> bool {
         !self.sentences.is_empty() || !self.text.is_empty()
     }
 
     pub fn resolved_sentences(&self) -> Result<Vec<SentenceState>, String> {
         let mut copy = Block::new(self.id);
+        copy.narrator.language.clone_from(&self.narrator.language);
         copy.text = self.text.clone();
         copy.sentences = self.sentences.clone();
         copy.sentence_serial = self.sentence_serial;
@@ -34,7 +62,7 @@ impl Block {
             old.text = old.sentences.iter().map(|s| s.text.as_str()).collect();
             old
         });
-        let ranges = sentences::partition(&self.text);
+        let ranges = sentences::partition_for_language(&self.text, &self.narrator.language);
         let texts: Vec<_> = ranges.iter().map(|r| &self.text[r.bytes.clone()]).collect();
         if self.sentences.len() == texts.len()
             && self.sentences.iter().zip(&texts).all(|(a, b)| a.text == *b)
@@ -96,7 +124,7 @@ impl Block {
                 .collect::<String>()
                 != self.text
         {
-            return sentences::partition(&self.text);
+            return sentences::partition_for_language(&self.text, &self.narrator.language);
         }
         let (mut byte, mut scalar) = (0, 0);
         self.sentences

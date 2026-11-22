@@ -6,12 +6,21 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub value_policy: roicepeak::scalar_layers::ValuePolicy,
-    pub dictionary: PathBuf,
-    pub voices: BTreeMap<String, VoiceBinding>,
-    pub selections: Vec<VoiceSource>,
+    pub dictionary: Option<PathBuf>,
+    pub voices: Arc<BTreeMap<String, VoiceBinding>>,
+    pub selections: Arc<[VoiceSource]>,
+}
+impl PartialEq for Config {
+    fn eq(&self, other: &Self) -> bool {
+        self.value_policy == other.value_policy
+            && self.dictionary == other.dictionary
+            && (Arc::ptr_eq(&self.voices, &other.voices) || self.voices == other.voices)
+            && (Arc::ptr_eq(&self.selections, &other.selections)
+                || self.selections == other.selections)
+    }
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct VoiceSource {
@@ -48,22 +57,24 @@ pub struct EmotionBinding {
 }
 impl Config {
     pub fn from_catalog(
-        dictionary: PathBuf,
+        dictionary: Option<PathBuf>,
         catalog: &crate::app::catalog::Catalog,
     ) -> Result<Self, String> {
         let config = Self {
             value_policy: Default::default(),
             dictionary,
-            voices: catalog
-                .voices
-                .iter()
-                .map(|voice| (voice.key.clone(), voice.binding.clone()))
-                .collect(),
+            voices: Arc::new(
+                catalog
+                    .voices
+                    .iter()
+                    .map(|voice| (voice.key.clone(), voice.binding.clone()))
+                    .collect(),
+            ),
             selections: catalog
                 .voices
                 .iter()
                 .map(|voice| VoiceSource {
-                    identity: voice.name.clone(),
+                    identity: voice.collection_name.clone(),
                     languages: voice.languages.clone(),
                     version: voice.version,
                     binding_key: voice.key.clone(),
@@ -74,7 +85,7 @@ impl Config {
         Ok(config)
     }
     pub fn binding(&self, reference: &VoiceRef) -> Result<&VoiceBinding, String> {
-        if reference.language != "japanese" {
+        if roicepeak::speech_frontend::Language::from_name(&reference.language).is_none() {
             return Err(format!(
                 "No text frontend for language {:?}",
                 reference.language
@@ -87,14 +98,20 @@ impl Config {
             .ok_or_else(|| format!("No model binding for narrator {reference}"))
     }
     pub(super) fn validate(&self) -> Result<(), String> {
-        if self.dictionary.as_os_str().is_empty()
-            || self.voices.is_empty()
+        if self.voices.is_empty()
             || self.voices.len() > 256
             || self.selections.len() != self.voices.len()
         {
-            return Err("A dictionary and 1 to 256 resolved catalog voices are required".into());
+            return Err("The catalog must contain 1 to 256 resolved voices".into());
         }
-        for source in &self.selections {
+        if self
+            .dictionary
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err("Invalid Japanese dictionary path".into());
+        }
+        for source in self.selections.iter() {
             if source.identity.is_empty()
                 || source.identity.len() > 4096
                 || source.languages.is_empty()
@@ -103,7 +120,7 @@ impl Config {
                 return Err("Invalid narrator selection metadata".into());
             }
         }
-        for (name, voice) in &self.voices {
+        for (name, voice) in self.voices.iter() {
             if name.is_empty()
                 || name.len() > 4096
                 || voice.source.as_os_str().is_empty()

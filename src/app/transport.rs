@@ -52,7 +52,7 @@ impl EditorApp {
     pub(crate) fn play_pause(&mut self) -> Result<(), String> {
         self.synchronize_transport();
         if self.transport == Transport::Playing {
-            self.pause_transport();
+            self.pause_at_word();
             return Ok(());
         }
         self.playback_scope = Scope::Project;
@@ -63,7 +63,7 @@ impl EditorApp {
     pub(crate) fn play_current_block(&mut self) -> Result<(), String> {
         self.synchronize_transport();
         if self.transport == Transport::Playing {
-            self.pause_transport();
+            self.pause_at_word();
             return Ok(());
         }
         let block = self
@@ -71,6 +71,7 @@ impl EditorApp {
             .and_then(|index| self.project.blocks.get(index))
             .ok_or("Select a block first")?;
         self.playback_scope = Scope::Block(block.id);
+        self.pending_control_seek = None;
         self.playhead = self
             .rendered_blocks
             .get(&block.id)
@@ -88,7 +89,56 @@ impl EditorApp {
         // Keep pending synthesis while paused.
     }
 
+    fn pause_at_word(&mut self) {
+        self.pause_transport();
+        if self.player.loaded()
+            && let Some(time) = self
+                .playback_guide
+                .pause_position(self.playhead, self.playback_scope)
+        {
+            self.playhead = time;
+            self.player.seek_at_or_after(time);
+        }
+    }
+
+    pub(super) fn seek_to_word(&mut self, time: f64) {
+        self.pause_transport();
+        self.pending_control_seek = None;
+        self.playback_scope = Scope::Project;
+        self.playhead = time;
+        self.player.full_range();
+        self.player.seek_at_or_after(time);
+        self.discard_uncovered_playback();
+    }
+
+    fn discard_uncovered_playback(&mut self) -> bool {
+        if self
+            .playback
+            .as_ref()
+            .is_some_and(|source| !source.covers_seek(self.playhead))
+        {
+            self.player.stop();
+            if let Some(source) = self.playback.take() {
+                source.cancel();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn resume_after_seek(&mut self) -> Result<(), String> {
+        if self.discard_uncovered_playback() && self.transport == Transport::Playing {
+            self.prepare_playback(Command::PlayPause)
+        } else {
+            Ok(())
+        }
+    }
+
     fn prepare_playback(&mut self, _command: Command) -> Result<(), String> {
+        self.playback_start = self
+            .playback_guide
+            .anchor(self.playhead, self.playback_scope);
         if self
             .playback
             .as_ref()
@@ -97,6 +147,7 @@ impl EditorApp {
             self.player.stop();
             self.playback = None;
         }
+        self.discard_uncovered_playback();
         let result = if self.playback_pending {
             Ok(())
         } else if self.playback.is_none() && self.rendered_audio.is_empty() {
@@ -109,9 +160,15 @@ impl EditorApp {
                     project: self.project.clone(),
                     user_dictionary: self.dictionary_snapshot()?,
                 };
+                let prepared = self.export.prepared_playback(&request);
                 match self.playback_scope {
-                    Scope::Project => self.render_worker.start_playback(request, self.playhead)?,
-                    Scope::Block(id) => self.render_worker.start_block_playback(request, id)?,
+                    Scope::Project => {
+                        self.render_worker
+                            .start_playback(request, self.playhead, prepared)?
+                    }
+                    Scope::Block(id) => self
+                        .render_worker
+                        .start_block_playback(request, id, prepared)?,
                 }
                 self.playback_pending = true;
                 self.render_status = "Synthesizing…".into();
@@ -139,17 +196,24 @@ impl EditorApp {
             if !(start..end).contains(&self.playhead) {
                 self.playhead = start;
             }
+        } else if self
+            .playback
+            .as_ref()
+            .is_some_and(|source| self.playhead >= source.duration())
+        {
+            self.playhead = 0.0;
+        }
+        if self.discard_uncovered_playback() {
+            return self.prepare_playback(Command::PlayPause);
         }
         self.ensure_player()?;
         match self.playback_scope {
             Scope::Project => {
                 self.player.full_range();
-                self.player
-                    .seek(if self.playhead >= self.player.duration() {
-                        0.0
-                    } else {
-                        self.playhead
-                    });
+                if self.playhead >= self.player.duration() {
+                    self.playhead = 0.0;
+                }
+                self.player.seek_at_or_after(self.playhead);
             }
             Scope::Block(id) => {
                 let (start, end) = self.block_audio_range_for(id)?;
@@ -159,11 +223,20 @@ impl EditorApp {
                 } else {
                     start
                 };
-                self.player.seek(self.playhead);
+                self.player.seek_at_or_after(self.playhead);
             }
         }
+        self.playback_start = self
+            .playback_guide
+            .anchor(self.playhead, self.playback_scope);
         self.player.resume();
         Ok(())
+    }
+
+    pub(crate) fn retime_control_seek(&mut self) {
+        if let Some(anchor) = self.pending_control_seek.take() {
+            self.playhead = self.playback_guide.retime(anchor);
+        }
     }
 
     /// Observe completion of an already started device stream, never render readiness.
@@ -172,8 +245,16 @@ impl EditorApp {
             if self.transport == Transport::Playing && self.player.ended() {
                 self.playhead = self.player.position();
                 if self.loop_playback {
-                    self.player.rewind_range();
-                    self.player.resume();
+                    self.playhead = self.player.range_seconds().map_or(0.0, |range| range.0);
+                    let rebuild = self.discard_uncovered_playback();
+                    if rebuild {
+                        if let Err(error) = self.prepare_playback(Command::PlayPause) {
+                            self.error = Some(error);
+                        }
+                    } else {
+                        self.player.rewind_range();
+                        self.player.resume();
+                    }
                 } else {
                     self.transport = Transport::Stopped;
                 }
@@ -275,9 +356,10 @@ impl EditorApp {
                         )
                     })
                     .collect();
-                self.dirty |= updated != self.project;
                 self.project = updated;
                 self.query_basis_current = true;
+                self.playback_guide.replace(&source.plan.blocks);
+                self.retime_control_seek();
                 self.playback_generation = source.generation;
                 self.playhead = self.playhead.min(duration);
                 self.playback = Some(source);

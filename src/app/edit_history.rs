@@ -47,6 +47,21 @@ impl EditorApp {
         }
     }
 
+    pub(crate) fn begin_parameter_edit(&mut self) {
+        self.begin_edit();
+        let anchor = if self.transport == crate::app::transport::Transport::Playing
+            && self.playback_guide.word.is_some()
+        {
+            self.playback_start
+        } else {
+            self.pending_control_seek.unwrap_or_else(|| {
+                self.playback_guide
+                    .anchor(self.playhead, self.playback_scope)
+            })
+        };
+        self.pending_control_seek = Some(anchor);
+    }
+
     pub(crate) fn push_history(&mut self, previous: Project, selection: BlockSelection) {
         self.content_changed(&previous);
         self.store_undo(Entry {
@@ -57,7 +72,12 @@ impl EditorApp {
 
     pub(crate) fn content_changed(&mut self, previous: &Project) {
         self.query_basis_current &= crate::app::query_basis::matches(previous, &self.project);
+        let seek = self.pending_control_seek.take();
         self.invalidate_audio();
+        if let Some(anchor) = seek {
+            self.playhead = anchor.time;
+            self.pending_control_seek = Some(anchor);
+        }
         self.dirty = true;
         self.prepare_project();
     }

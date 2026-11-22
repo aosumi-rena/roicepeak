@@ -85,6 +85,10 @@ pub(crate) fn combo_face(ui: &egui::Ui, rect: Rect, caption: &str) {
 }
 
 pub(crate) fn combo_face_colored(ui: &egui::Ui, rect: Rect, caption: &str, color: Color32) {
+    paint_combo_face(ui, rect, caption, color, false);
+}
+
+fn paint_combo_face(ui: &egui::Ui, rect: Rect, caption: &str, color: Color32, fit: bool) {
     ui.painter().rect_filled(rect, 4, Color32::WHITE);
     ui.painter().rect_stroke(
         rect.shrink(0.5),
@@ -97,13 +101,24 @@ pub(crate) fn combo_face_colored(ui: &egui::Ui, rect: Rect, caption: &str, color
         label.min + Vec2::new(5.0, 1.0),
         label.max - Vec2::new(5.0, 1.0),
     );
+    let mut font = style::font(20.880_001 / 1.48);
+    if fit {
+        let width = ui
+            .painter()
+            .layout_no_wrap(caption.to_owned(), font.clone(), color)
+            .size()
+            .x;
+        if width > text.width() {
+            font.size *= text.width() / width;
+        }
+    }
     ui.painter()
         .with_clip_rect(text.intersect(ui.clip_rect()))
         .text(
             text.left_center(),
             egui::Align2::LEFT_CENTER,
             caption,
-            style::font(20.880_001 / 1.48),
+            font,
             color,
         );
     let at = egui::pos2(rect.right() - 20.0, rect.center().y - 3.5);
@@ -132,6 +147,28 @@ pub(crate) fn combo<T: Clone + PartialEq>(
     value: &mut T,
     choices: &[(T, &str)],
 ) -> bool {
+    combo_with_color(ui, rect, id, value, choices, None)
+}
+
+pub(crate) fn combo_fitted<T: Clone + PartialEq>(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    id: Id,
+    value: &mut T,
+    choices: &[(T, &str)],
+    color: Color32,
+) -> bool {
+    combo_with_color(ui, rect, id, value, choices, Some(color))
+}
+
+fn combo_with_color<T: Clone + PartialEq>(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    id: Id,
+    value: &mut T,
+    choices: &[(T, &str)],
+    color: Option<Color32>,
+) -> bool {
     let caption = choices
         .iter()
         .find(|(key, _)| key == value)
@@ -140,7 +177,13 @@ pub(crate) fn combo<T: Clone + PartialEq>(
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, ui.is_enabled(), caption)
     });
-    combo_face(ui, rect, caption);
+    paint_combo_face(
+        ui,
+        rect,
+        caption,
+        color.unwrap_or(style::TEXT),
+        color.is_some(),
+    );
     let open = egui::Popup::is_id_open(ui.ctx(), id);
     let input = combo_input(ui, &response, open, true, || {
         (

@@ -6,22 +6,28 @@ pub use query::PreparedQuery;
 mod duration;
 #[path = "synthesis_intonation.rs"]
 mod intonation;
+#[path = "synthesis_mandarin.rs"]
+mod mandarin;
+#[path = "synthesis_models.rs"]
+mod models;
+pub use models::ModelMemory;
+pub(crate) use models::VoiceNodes;
+use models::{Acoustic, CompiledModels};
 
 use crate::{
     Result,
-    acoustic::LegacyAcoustic,
     dnni::Node,
     graph::Budget,
     invalid,
-    language::{CharacterCache, LanguageModel},
-    modern::{AcousticDecoder, PitchModel, StyleLayout},
-    phonemes::{Encoded, PhonemeEncoder, Token},
-    prosody::{Prosody, logit},
+    language::CharacterCache,
+    modern::streaming::AcousticPackets,
+    phonemes::{Encoded, Token},
+    prosody::logit,
     sampling::{frame_noise, phoneme_seeds},
     scalar_layers::ScalarLayers,
-    stylebook::{Offsets, Style, Stylebook, speaker_vector, split_speakers},
+    stylebook::{Style, Stylebook},
     tensor::Tensor,
-    vocoder::{Effects, Vocoder},
+    vocoder::{Effects, PcmPackets},
 };
 use std::{
     collections::BTreeMap,
@@ -39,7 +45,7 @@ pub struct Parameters {
     pub fixed_seeding: bool,
 }
 /// Explicit edits use encoded phone indices and global syllable slots.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Edits {
     pub accent_codes: Option<Vec<u32>>,
     /// Token/syllable mask: false retains the supplied code, true permits prediction.
@@ -104,22 +110,15 @@ impl Default for Parameters {
         }
     }
 }
-enum Acoustic {
-    Legacy(LegacyAcoustic),
-    Modern(PitchModel, AcousticDecoder, Vec<f32>, Vec<f32>),
-}
 pub struct Synthesizer {
     identity: Arc<()>,
-    encoder: PhonemeEncoder,
-    lm: LanguageModel,
-    prosody: Prosody,
-    acoustic: Acoustic,
-    vocoder: Vocoder,
+    models: Arc<CompiledModels>,
     stylebook: Stylebook,
-    style_layout: Option<StyleLayout>,
     speaker: usize,
     speaker_im: Vec<f32>,
     speaker_accent: Vec<f32>,
+    speaker_pitch: Vec<f32>,
+    speaker_decoder: Vec<f32>,
 }
 pub struct Models<'a, 'b> {
     pub phonemes: &'b Node<'a>,
@@ -165,107 +164,6 @@ pub struct RenderTimings {
     pub total: Duration,
 }
 impl Synthesizer {
-    /// Retained heap charge, excluding the inline Synthesizer itself.
-    pub fn estimated_bytes(&self) -> usize {
-        use crate::memory as m;
-        let acoustic = match &self.acoustic {
-            Acoustic::Legacy(value) => value.estimated_bytes(),
-            Acoustic::Modern(pitch, decoder, a, b) => m::sum([
-                pitch.estimated_bytes(),
-                decoder.estimated_bytes(),
-                m::values(a),
-                m::values(b),
-            ]),
-        };
-        m::sum([
-            m::arc::<()>(0),
-            self.encoder.estimated_bytes(),
-            self.lm.estimated_bytes(),
-            self.prosody.estimated_bytes(),
-            acoustic,
-            self.vocoder.estimated_bytes(),
-            self.stylebook.estimated_bytes(),
-            m::values(&self.speaker_im),
-            m::values(&self.speaker_accent),
-        ])
-    }
-
-    pub fn compile(
-        models: Models<'_, '_>,
-        speaker: usize,
-        offsets: Option<Offsets>,
-        style_phones: Vec<String>,
-        custom_speaker: Option<&[f32]>,
-    ) -> Result<Self> {
-        let encoder = PhonemeEncoder::compile(models.phonemes)?;
-        if models.acoustic.tag == "_ttsna0" && custom_speaker.is_some() {
-            return Err(invalid("custom speakers require modern acoustic models"));
-        }
-        let mut owners: Vec<_> = models.acoustic.children.iter().collect();
-        owners.extend([models.intonation, models.accent]);
-        let custom = custom_speaker
-            .map(|values| split_speakers(values, &owners))
-            .transpose()?;
-        let vector = |owner: &Node<'_>| match &custom {
-            Some(v) => v
-                .get(&owner.tag)
-                .cloned()
-                .ok_or_else(|| invalid("missing custom speaker owner")),
-            None => speaker_vector(owner, speaker),
-        };
-        let acoustic = if models.acoustic.tag == "_ttsna0" {
-            Acoustic::Legacy(LegacyAcoustic::compile(models.acoustic)?)
-        } else {
-            Acoustic::Modern(
-                PitchModel::compile(models.acoustic)?,
-                AcousticDecoder::compile(models.acoustic)?,
-                vector(
-                    models
-                        .acoustic
-                        .children
-                        .iter()
-                        .find(|n| n.tag.starts_with("_ttsdf"))
-                        .ok_or_else(|| invalid("missing pitch owner"))?,
-                )?,
-                vector(
-                    models
-                        .acoustic
-                        .children
-                        .iter()
-                        .find(|n| n.tag.starts_with("_ttsdt"))
-                        .ok_or_else(|| invalid("missing timbre owner"))?,
-                )?,
-            )
-        };
-        let style_layout = match &acoustic {
-            Acoustic::Legacy(_) => None,
-            Acoustic::Modern(pitch, decoder, _, _) => {
-                Some(StyleLayout::compile(models.acoustic, pitch, decoder)?)
-            }
-        };
-        let stylebook = match style_layout {
-            Some(layout) => Stylebook::compile_for_model(
-                models.stylebook,
-                offsets,
-                style_phones,
-                layout.channels(),
-            )?,
-            None => Stylebook::compile(models.stylebook, offsets, style_phones)?,
-        };
-        Ok(Self {
-            identity: Arc::new(()),
-            prosody: Prosody::compile(models.intonation, models.accent, encoder.format.clone())?,
-            encoder,
-            lm: LanguageModel::compile(models.language)?,
-            acoustic,
-            vocoder: Vocoder::compile(models.vocoder)?,
-            stylebook,
-            style_layout,
-            speaker,
-            speaker_im: vector(models.intonation)?,
-            speaker_accent: vector(models.accent)?,
-        })
-    }
     pub fn emotions(&self) -> &[String] {
         &self.stylebook.emotions
     }
@@ -275,17 +173,19 @@ impl Synthesizer {
     }
 
     fn style_inputs<'a>(&self, embedding: &'a [f32]) -> Result<(&'a [f32], &'a [f32])> {
-        match self.style_layout {
+        match self.models.style_layout {
             Some(layout) => layout.split(embedding),
             None => Ok((embedding, embedding)),
         }
     }
     pub fn set_vocoder_effects(&mut self, effects: Effects) {
-        self.vocoder.set_effects(effects);
+        Arc::make_mut(&mut self.models).vocoder.set_effects(effects);
         self.identity = Arc::new(());
     }
     pub fn set_character_cache(&mut self, cache: CharacterCache) -> Result<()> {
-        self.lm.set_character_cache(cache)?;
+        Arc::make_mut(&mut self.models)
+            .lm
+            .set_character_cache(cache)?;
         self.identity = Arc::new(());
         Ok(())
     }
@@ -339,6 +239,7 @@ impl Synthesizer {
             budget,
             collect_timings,
             scalars,
+            0,
             None,
         )?;
         if let (Some(timings), Some(query_timings), Some(started)) =
@@ -386,7 +287,7 @@ impl Synthesizer {
         if !params.fixed_seeding && (edits.seed_variations.is_some() || edits.seed_base != 0) {
             return Err(invalid("seed variations and base require fixed seeding"));
         }
-        if matches!(self.acoustic, Acoustic::Legacy(_))
+        if matches!(self.models.acoustic.as_ref(), Acoustic::Legacy(_))
             && (edits.seed_variations.is_some() || edits.seed_base != 0)
         {
             return Err(invalid(
@@ -404,7 +305,8 @@ impl Synthesizer {
         budget: &mut Budget,
         collect_timings: bool,
         scalar_layers: Option<crate::scalar_layers::ResolvedScalars>,
-        emit: Option<&mut dyn FnMut(&[f32]) -> Result<()>>,
+        first_frame: usize,
+        mut emit: Option<&mut dyn FnMut(&[f32]) -> Result<()>>,
     ) -> Result<Render> {
         prepared.validate(self, edits)?;
         let started = collect_timings.then(Instant::now);
@@ -422,6 +324,7 @@ impl Synthesizer {
         let predict = &prepared.prediction_mask;
         let controlled = self.prepared_controls_impl(prepared, params, edits)?;
         let controls = controlled.values;
+        let mut mandarin = self.mandarin_pitch(prepared, &controls, first_frame);
         let controls_elapsed = stage_elapsed();
         let mut stages = BTreeMap::new();
         if let Some(mask) = predict {
@@ -432,7 +335,51 @@ impl Synthesizer {
         }
         stages.insert("language", prepared.language.clone());
         stages.insert("prosody", prepared.prosody.clone());
-        let mut physical = match &self.acoustic {
+        let publish_packets = emit.is_some();
+        let bap = style.aperiodicity.unwrap_or([0.0; 5]);
+        let gain = if scalar_layers.is_some() {
+            style.gain() as f32
+        } else {
+            style.gain() as f32 * (params.volume / 100.0)
+        };
+        if !gain.is_finite() {
+            return Err(invalid("output volume gain overflow"));
+        }
+        let scale = |sample: f32| -> Result<f32> {
+            let mut sample = sample * gain;
+            if let Some(scalars) = scalar_layers {
+                sample = (f64::from(sample) * scalars.volume_gain) as f32;
+            }
+            if !sample.is_finite() {
+                return Err(invalid("non-finite inference result"));
+            }
+            Ok(sample)
+        };
+        let mut publish = |samples: &[f32]| -> Result<()> {
+            if let Some(emit) = emit.as_deref_mut() {
+                let scaled = samples
+                    .iter()
+                    .copied()
+                    .map(&scale)
+                    .collect::<Result<Vec<_>>>()?;
+                emit(&scaled)?;
+            }
+            Ok(())
+        };
+        let mut streamed_pcm = None;
+        let mut streamed_vocoder_time = Duration::ZERO;
+        let mut feed_vocoder =
+            |vocoder: &mut PcmPackets<'_>, physical: &mut Tensor, end, budget: &mut Budget| {
+                constrain_physical(physical, bap);
+                mandarin.apply(physical.values_mut(), self.models.vocoder.forces_voicing());
+                let started = collect_timings.then(Instant::now);
+                vocoder.feed(physical, end, budget, &mut publish)?;
+                if let Some(started) = started {
+                    streamed_vocoder_time += started.elapsed();
+                }
+                Ok(())
+            };
+        let mut physical = match self.models.acoustic.as_ref() {
             Acoustic::Legacy(m) => {
                 let features = Tensor::new(
                     x.linguistic.rows(),
@@ -441,9 +388,37 @@ impl Synthesizer {
                         .flat_map(|t| x.linguistic.row(t)[2..].iter().copied())
                         .collect(),
                 )?;
-                m.run(&features, &controls, &style.embedding, self.speaker, budget)?
+                if publish_packets {
+                    let mut vocoder = None;
+                    let physical = m.run_streamed(
+                        &features,
+                        &controls,
+                        &style.embedding,
+                        self.speaker,
+                        first_frame,
+                        budget,
+                        &mut |physical, end, frames, budget| {
+                            let vocoder = match &mut vocoder {
+                                Some(vocoder) => vocoder,
+                                slot @ None => slot.insert(PcmPackets::new(
+                                    &self.models.vocoder,
+                                    frames,
+                                    style.tension,
+                                    budget,
+                                )?),
+                            };
+                            feed_vocoder(vocoder, physical, end, budget)
+                        },
+                    )?;
+                    streamed_pcm = vocoder.map(PcmPackets::finish).transpose()?;
+                    physical
+                } else {
+                    m.run(&features, &controls, &style.embedding, self.speaker, budget)?
+                }
             }
-            Acoustic::Modern(pitch, decoder, pitch_speaker, decoder_speaker) => {
+            Acoustic::Modern(pitch, decoder) => {
+                let pitch_speaker = &self.speaker_pitch;
+                let decoder_speaker = &self.speaker_decoder;
                 let (pitch_style, decoder_style) = self.style_inputs(&style.embedding)?;
                 let counts: Vec<_> = controls
                     .values()
@@ -462,13 +437,15 @@ impl Synthesizer {
                 } else {
                     None
                 };
-                let mut pitch_input = x.linguistic.clone();
+                let acoustic_features = self.models.encoder.acoustic_features(&x);
+                let acoustic_input = acoustic_features.as_ref().unwrap_or(&x.linguistic);
+                let mut pitch_input = acoustic_input.clone();
                 for t in 0..pitch_input.rows() {
-                    for flag in &self.encoder.format.slots[1..3] {
+                    for flag in &self.models.encoder.format.slots[1..3] {
                         pitch_input.row_mut(t)[flag + 2] = 0.0;
                     }
                 }
-                let noise = frame_noise(
+                let pitch_noise = frame_noise(
                     &counts,
                     pitch.noise_channels(),
                     0.5,
@@ -476,15 +453,7 @@ impl Synthesizer {
                     &mut pitch.noise_stream(),
                     budget,
                 )?;
-                let f0 = pitch.run_with_speaker(
-                    &pitch_input,
-                    &controls,
-                    pitch_style,
-                    pitch_speaker,
-                    Some(&noise),
-                    budget,
-                )?;
-                let noise = frame_noise(
+                let decoder_noise = frame_noise(
                     &counts,
                     decoder.noise_channels(),
                     0.75,
@@ -492,82 +461,81 @@ impl Synthesizer {
                     &mut decoder.noise_stream(),
                     budget,
                 )?;
-                let physical = decoder.run_with_speaker(
-                    &x.linguistic,
-                    &controls,
-                    &f0,
-                    decoder_style,
-                    decoder_speaker,
-                    Some(&noise),
-                    budget,
-                )?;
+                let frames = pitch_noise.rows();
+                let packets = if publish_packets && (frames >= 1600 || first_frame != 0) {
+                    match AcousticPackets::new(pitch, decoder) {
+                        Ok(packets) => Some(packets),
+                        Err(_) if first_frame == 0 => None,
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    None
+                };
+                let (f0, physical) = if let Some(packets) = packets {
+                    let mut vocoder = PcmPackets::new(
+                        &self.models.vocoder,
+                        frames.checked_sub(first_frame).ok_or_else(|| {
+                            invalid("acoustic playback starts after the sentence")
+                        })?,
+                        style.tension,
+                        budget,
+                    )?;
+                    let result = packets.render(
+                        &pitch_input,
+                        acoustic_input,
+                        &controls,
+                        (pitch_style, decoder_style),
+                        (pitch_speaker, decoder_speaker),
+                        (&pitch_noise, &decoder_noise),
+                        first_frame,
+                        budget,
+                        |physical, end, budget| feed_vocoder(&mut vocoder, physical, end, budget),
+                    )?;
+                    streamed_pcm = Some(vocoder.finish()?);
+                    result
+                } else {
+                    let f0 = pitch.run_with_speaker(
+                        &pitch_input,
+                        &controls,
+                        pitch_style,
+                        pitch_speaker,
+                        Some(&pitch_noise),
+                        budget,
+                    )?;
+                    let physical = decoder.run_with_speaker(
+                        acoustic_input,
+                        &controls,
+                        &f0,
+                        decoder_style,
+                        decoder_speaker,
+                        Some(&decoder_noise),
+                        budget,
+                    )?;
+                    (f0, physical)
+                };
                 stages.insert("pitch", f0);
                 physical
             }
         };
-        let bap = style.aperiodicity.unwrap_or([0.0; 5]);
-        for t in 0..physical.rows() {
-            let row = physical.row_mut(t);
-            row[0] = row[0].clamp(0.0, 1.0);
-            row[2] = row[2].clamp(0.01, 3.0);
-            for (value, offset) in row[67..72].iter_mut().zip(bap) {
-                *value = (*value + offset).clamp(0.0, 1.0);
-            }
+        if streamed_pcm.is_none() {
+            constrain_physical(&mut physical, bap);
+            mandarin.apply(physical.values_mut(), self.models.vocoder.forces_voicing());
         }
-        let acoustic_elapsed = stage_elapsed();
-        let gain = if scalar_layers.is_some() {
-            let gain = style.gain() as f32;
-            if !gain.is_finite() {
-                return Err(invalid("style volume gain overflow"));
+        let acoustic_elapsed = stage_elapsed().saturating_sub(streamed_vocoder_time);
+        let mut pcm = match streamed_pcm {
+            Some(pcm) => pcm,
+            None => {
+                self.models
+                    .vocoder
+                    .render_pcm(&physical, style.tension, budget, &mut publish)?
             }
-            gain
-        } else {
-            let gain = style.gain() as f32 * (params.volume / 100.0);
-            if !gain.is_finite() {
-                return Err(invalid("output volume gain overflow"));
-            }
-            gain
         };
-        let scale = |sample: f32| -> Result<f32> {
-            let mut sample = sample * gain;
-            if let Some(scalars) = scalar_layers {
-                sample = (f64::from(sample) * scalars.volume_gain) as f32;
-            }
-            if !sample.is_finite() {
-                return Err(invalid("non-finite inference result"));
-            }
-            Ok(sample)
-        };
-        let rendered = if let Some(emit) = emit {
-            let mut publish = |samples: &[f32]| -> Result<()> {
-                let scaled = samples
-                    .iter()
-                    .copied()
-                    .map(&scale)
-                    .collect::<Result<Vec<_>>>()?;
-                emit(&scaled)
-            };
-            self.vocoder.run_with_tension_streamed(
-                &physical,
-                style.tension,
-                budget,
-                &mut publish,
-            )?
-        } else {
-            self.vocoder
-                .run_with_tension(&physical, style.tension, budget)?
-        };
-        let mut pcm = rendered
-            .stages
-            .get("pcm")
-            .ok_or_else(|| invalid("vocoder did not return PCM"))?
-            .clone();
         for t in 0..pcm.rows() {
             let sample = &mut pcm.row_mut(t)[0];
             *sample = scale(*sample)?;
         }
         pcm.ensure_finite()?;
-        let vocoder_and_gain_elapsed = stage_elapsed();
+        let vocoder_and_gain_elapsed = stage_elapsed() + streamed_vocoder_time;
         stages.insert("controls", controls);
         stages.insert("physical", physical);
         stages.insert("pcm", pcm);
@@ -583,13 +551,40 @@ impl Synthesizer {
         Ok(Render {
             encoded: x,
             raw_query_durations: prepared.raw_query_durations.clone(),
-            raw_query_intonation: prepared.intonation_coordinates(params.invert_intonation),
+            raw_query_intonation: prepared
+                .intonation_coordinates(params.invert_intonation || scalar_layers.is_some()),
             phone_timing: controlled.phone_timing,
             stages,
             timings,
         })
     }
+
+    fn mandarin_pitch(
+        &self,
+        prepared: &PreparedQuery,
+        controls: &Tensor,
+        first_frame: usize,
+    ) -> mandarin::Contour {
+        mandarin::Contour::new(
+            &prepared.encoded,
+            &prepared.prosody,
+            controls,
+            self.models.encoder.mandarin_without_tones(),
+            first_frame,
+        )
+    }
 }
+
+fn constrain_physical(physical: &mut Tensor, bap: [f32; 5]) {
+    for row in physical.values_mut().chunks_exact_mut(72) {
+        row[0] = row[0].clamp(0.0, 1.0);
+        row[2] = row[2].clamp(0.01, 3.0);
+        for (value, offset) in row[67..].iter_mut().zip(bap) {
+            *value = (*value + offset).clamp(0.0, 1.0);
+        }
+    }
+}
+
 fn prepare_controls(
     x: &Encoded,
     predicted: &Tensor,
@@ -607,6 +602,12 @@ fn prepare_controls(
         .scalar_layers
         .map(|layers| layers.resolve_with_policy(edits.value_policy))
         .transpose()?;
+    // Positive editor adjustments raise pitch.
+    let adjustment_direction = if scalar_layers.is_some() && !params.invert_intonation {
+        -1.0
+    } else {
+        1.0
+    };
     let mut intonation = Vec::with_capacity(n);
     for t in 0..n {
         intonation.push(1.0 / (1.0 + (-(logit(predicted.row(t)[1]) + style.intonation)).exp()));
@@ -722,13 +723,16 @@ fn prepare_controls(
             } else {
                 *v
             };
-            let z = edits.intonation_delta.get(&i).map_or(z, |delta| *delta + z);
+            let z = edits
+                .intonation_delta
+                .get(&i)
+                .map_or(z, |delta| *delta * adjustment_direction + z);
             *v = (f64::from(z.clamp(-3.0, 3.0)) * deviation + mean) as f32;
         }
     }
     let offset = scalar_layers.map_or_else(
         || (params.pitch / 100.0) * (1.0f32 / 12.0),
-        |scalars| scalars.pitch_offset,
+        |scalars| scalars.pitch_offset * adjustment_direction,
     );
     for (i, r) in x.references.iter().enumerate() {
         if x.nucleus[i] {

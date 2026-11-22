@@ -77,7 +77,7 @@ pub(super) fn extend(
         .ok_or("Native emotion pool missing")?;
     let mut keys = pool.keys().cloned().collect::<BTreeSet<_>>();
     let mut versions = BTreeMap::<String, i32>::new();
-    for source in &config.selections {
+    for source in config.selections.iter() {
         if source.identity.is_empty()
             || source.identity.len() > 4096
             || source.identity.contains('\0')

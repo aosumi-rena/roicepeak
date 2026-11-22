@@ -38,11 +38,13 @@ use crate::{
 pub use analytic_probe::{
     LfArguments, LfSpectrum, diagnostic_lf_arguments, diagnostic_lf_spectrum,
 };
+pub(crate) use dsp::HOP;
 pub use effects::{Effects, SpectrumKind};
 pub use harmonic_probe::{LfHarmonics, diagnostic_lf_harmonics, diagnostic_lf_phase_step};
 pub use input_probe::{VocoderLogarithms, diagnostic_vocoder_logarithms};
 pub use source_probe::{LfSource, diagnostic_lf_source};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
+pub(crate) use streaming::PcmPackets;
 pub use transform_probe::{
     LfCzt, diagnostic_lf_chirp_arguments, diagnostic_lf_complex_fft, diagnostic_lf_czt,
     diagnostic_lf_generated_czt,
@@ -352,7 +354,12 @@ pub fn diagnostic_ltv_boundaries(
     })
 }
 
+#[derive(Clone)]
 pub struct Vocoder {
+    model: Arc<VocoderModel>,
+    effects: Effects,
+}
+struct VocoderModel {
     normalizer: Normalizer,
     input_configuration: normalization::InputConfiguration,
     shape: Graph,
@@ -367,7 +374,6 @@ pub struct Vocoder {
     spectral: bool,
     gate_noise: bool,
     filtered_postfilter_input: bool,
-    effects: Effects,
     sample_rate: f32,
 }
 pub struct Render {
@@ -401,18 +407,19 @@ fn taps(n: &Node<'_>, tag: &str) -> Result<Tensor> {
 }
 impl Vocoder {
     pub fn estimated_bytes(&self) -> usize {
-        crate::memory::sum([
-            self.normalizer.estimated_bytes(),
-            self.shape.estimated_bytes(),
-            self.trunk.estimated_bytes(),
-            self.harmonic.estimated_bytes(),
-            self.noise.estimated_bytes(),
-            self.analysis.estimated_bytes(),
-            self.synthesis.estimated_bytes(),
-            self.postfilter.estimated_bytes(),
-            self.projection.estimated_bytes(),
-            self.effects.estimated_bytes(),
-        ])
+        let model = &self.model;
+        crate::memory::arc::<VocoderModel>(crate::memory::sum([
+            model.normalizer.estimated_bytes(),
+            model.shape.estimated_bytes(),
+            model.trunk.estimated_bytes(),
+            model.harmonic.estimated_bytes(),
+            model.noise.estimated_bytes(),
+            model.analysis.estimated_bytes(),
+            model.synthesis.estimated_bytes(),
+            model.postfilter.estimated_bytes(),
+            model.projection.estimated_bytes(),
+        ]))
+        .saturating_add(self.effects.estimated_bytes())
     }
 
     pub fn compile(root: &Node<'_>) -> Result<Self> {
@@ -454,26 +461,31 @@ impl Vocoder {
         let normalizer = Normalizer::from_node(&c[0].children[0])?;
         let input_configuration = normalization::InputConfiguration::compile(&c[0], &normalizer)?;
         Ok(Self {
-            normalizer,
-            input_configuration,
-            shape: Graph::compile(&c[1])?,
-            trunk: Graph::compile(&c[2])?,
-            harmonic: Graph::compile(&c[3].children[0])?,
-            noise: Graph::compile(&c[4].children[0])?,
-            synthesis: taps(&c[5], "_ppusv0")?,
-            analysis: taps(&c[6], "_ppdsv0")?,
-            postfilter: Graph::compile(&c[7])?,
-            projection: Graph::compile(&c[8])?,
-            excitation_log_gain,
-            spectral: c[3].tag == "_ltvfl1",
-            gate_noise: root.payload[16] != 0,
-            filtered_postfilter_input: root.tag == "_nhvpl2" || root.payload[17] != 0,
+            model: Arc::new(VocoderModel {
+                normalizer,
+                input_configuration,
+                shape: Graph::compile(&c[1])?,
+                trunk: Graph::compile(&c[2])?,
+                harmonic: Graph::compile(&c[3].children[0])?,
+                noise: Graph::compile(&c[4].children[0])?,
+                synthesis: taps(&c[5], "_ppusv0")?,
+                analysis: taps(&c[6], "_ppdsv0")?,
+                postfilter: Graph::compile(&c[7])?,
+                projection: Graph::compile(&c[8])?,
+                excitation_log_gain,
+                spectral: c[3].tag == "_ltvfl1",
+                gate_noise: root.payload[16] != 0,
+                filtered_postfilter_input: root.tag == "_nhvpl2" || root.payload[17] != 0,
+                sample_rate: u32_at(c[0].payload, 8)? as f32,
+            }),
             effects: Effects::default(),
-            sample_rate: u32_at(c[0].payload, 8)? as f32,
         })
     }
     pub fn set_effects(&mut self, effects: Effects) {
         self.effects = effects;
+    }
+    pub(crate) fn forces_voicing(&self) -> bool {
+        self.model.input_configuration.force_voiced
     }
     pub fn run(&self, physical: &Tensor, budget: &mut Budget) -> Result<Render> {
         self.run_with_tension(physical, 0.0, budget)
@@ -493,6 +505,19 @@ impl Vocoder {
         budget: &mut Budget,
         emit: &mut dyn FnMut(&[f32]) -> Result<()>,
     ) -> Result<Render> {
-        streaming::render(self, physical, tension, budget, emit)
+        streaming::render(self, physical, tension, budget, emit, true)
+    }
+
+    pub(crate) fn render_pcm(
+        &self,
+        physical: &Tensor,
+        tension: f32,
+        budget: &mut Budget,
+        emit: &mut dyn FnMut(&[f32]) -> Result<()>,
+    ) -> Result<Tensor> {
+        streaming::render(self, physical, tension, budget, emit, false)?
+            .stages
+            .remove("pcm")
+            .ok_or_else(|| invalid("vocoder did not return PCM"))
     }
 }

@@ -1,5 +1,6 @@
 //! Ordered quantized products over independent output lanes.
 #![cfg(target_arch = "x86_64")]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use safe_arch::{
     add_i16_m128i, add_saturating_i16_m128i, m128i, mul_i16_keep_high_m128i,
@@ -35,6 +36,21 @@ pub fn integer_product(weights: &[i8], input: &[i16], output: &mut [i16], add: b
     if input.is_empty() {
         return;
     }
+    if width != 0
+        && width.is_multiple_of(16)
+        && input.len().checked_mul(width) == Some(weights.len())
+        && std::arch::is_x86_feature_detected!("avx2")
+    {
+        // Each vector load reads one complete group of 16 coefficients in its row.
+        unsafe {
+            if width.is_multiple_of(64) {
+                product_avx2::<4>(weights, input, output, add);
+            } else {
+                product_avx2::<1>(weights, input, output, add);
+            }
+        }
+        return;
+    }
     let grouped = width / 8 * 8;
     for first in (0..grouped).step_by(8) {
         let mut sum = rounded_lanes(
@@ -61,6 +77,40 @@ pub fn integer_product(weights: &[i8], input: &[i16], output: &mut [i16], add: b
             } else {
                 output[lane].saturating_add(product)
             };
+        }
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn product_avx2<const VECTORS: usize>(
+    weights: &[i8],
+    input: &[i16],
+    output: &mut [i16],
+    add: bool,
+) {
+    use std::arch::x86_64::*;
+
+    let width = output.len();
+    for (index, lanes) in output.chunks_exact_mut(16 * VECTORS).enumerate() {
+        let first = index * 16 * VECTORS;
+        let target = lanes.as_mut_ptr();
+        let mut sums = [_mm256_setzero_si256(); VECTORS];
+        if add {
+            for (lane, sum) in sums.iter_mut().enumerate() {
+                *sum = unsafe { _mm256_loadu_si256(target.add(lane * 16).cast()) };
+            }
+        }
+        for (&value, row) in input.iter().zip(weights.chunks_exact(width)) {
+            let broadcast = _mm256_set1_epi16(value);
+            let source = unsafe { row.as_ptr().add(first) };
+            for (lane, sum) in sums.iter_mut().enumerate() {
+                let packed = unsafe { _mm_loadu_si128(source.add(lane * 16).cast()) };
+                let coefficients = _mm256_slli_epi16::<8>(_mm256_cvtepi8_epi16(packed));
+                *sum = _mm256_adds_epi16(*sum, _mm256_mulhrs_epi16(broadcast, coefficients));
+            }
+        }
+        for (lane, sum) in sums.into_iter().enumerate() {
+            unsafe { _mm256_storeu_si256(target.add(lane * 16).cast(), sum) };
         }
     }
 }

@@ -268,7 +268,9 @@ impl EditorApp {
                                                 self.project.blocks.iter().find(|b| b.id == id)
                                             })
                                             .map(|block| &block.narrator)
-                                            .is_some_and(|current| current.identity == voice.name);
+                                            .is_some_and(|current| {
+                                                current.identity == voice.collection_name
+                                            });
                                         let alpha = if response.is_pointer_button_down_on() {
                                             26
                                         } else if response.hovered() || selected {
@@ -373,8 +375,7 @@ impl EditorApp {
                     for (index, reference) in resolved {
                         let block = &mut self.project.blocks[index];
                         if block.narrator != reference {
-                            block.narrator = reference;
-                            block.segments.clear();
+                            block.set_narrator(reference);
                         }
                     }
                 }

@@ -304,8 +304,7 @@ impl Graph {
             Self::Convolution(c) => c.run(x, budget)?,
             Self::Gru(g) => g.run(x, false, budget)?,
             Self::BidirectionalGru(a, b) => {
-                let f = a.run(x, false, budget)?;
-                let r = b.run(x, true, budget)?;
+                let (f, r) = a.run_directions(b, x, budget)?;
                 let cols = f.cols() + r.cols();
                 budget.spend(0, x.rows().saturating_mul(cols))?;
                 let mut out = Tensor::zeros(x.rows(), cols)?;

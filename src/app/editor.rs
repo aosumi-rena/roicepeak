@@ -33,8 +33,9 @@ pub enum PendingAction {
 
 pub struct EditorApp {
     pub catalog: crate::app::catalog::Catalog,
+    pub(super) catalog_load: Option<crate::app::voice_library::CatalogLoad>,
     pub portrait_state: crate::app::portrait::State,
-    pub avatar_cache: std::collections::BTreeMap<String, std::sync::Arc<[u8]>>,
+    pub(super) avatar_cache: std::collections::BTreeMap<String, crate::app::voice_library::Avatar>,
     pub resources: crate::app::resources::Locations,
     pub(crate) settings_state: crate::app::settings::State,
     pub resource_settings: bool,
@@ -57,12 +58,14 @@ pub struct EditorApp {
     pub error: Option<String>,
     pub filename: Option<PathBuf>,
     pub(crate) recent_projects: crate::app::recent_projects::RecentProjects,
+    window_title: String,
     pub dirty: bool,
     pub(crate) undo: Vec<crate::app::edit_history::Entry>,
     pub(crate) redo: Vec<crate::app::edit_history::Entry>,
     pub(crate) history_selection: Option<crate::app::block_selection::BlockSelection>,
     pub(crate) phoneme_history: crate::app::phoneme_history::State,
     pub font_points: f32,
+    pub(super) script_metrics: script_layout::MetricsCache,
     pub dictionary_ui: crate::app::dictionary::Editor,
     pub(crate) dictionary_state: crate::app::dictionary::State,
     pub playhead: f64,
@@ -78,6 +81,8 @@ pub struct EditorApp {
     pub rendered_audio: std::sync::Arc<Vec<f32>>,
     pub output_id: String,
     pub audio_outputs: Vec<crate::app::audio::Output>,
+    pub(super) audio_output_scan: Option<std::sync::mpsc::Receiver<Vec<crate::app::audio::Output>>>,
+    pub(super) audio_outputs_scanned: bool,
     pub loop_playback: bool,
     pub shortcuts: crate::app::shortcuts::ShortcutMap,
     pub shortcut_settings: bool,
@@ -92,6 +97,9 @@ pub struct EditorApp {
     pub playback_generation: u64,
     pub playback: Option<std::sync::Arc<crate::app::render::Playback>>,
     pub playback_pending: bool,
+    pub(crate) playback_guide: crate::app::script_playback::PlaybackGuide,
+    pub(crate) playback_start: crate::app::script_playback::PlaybackAnchor,
+    pub(crate) pending_control_seek: Option<crate::app::script_playback::PlaybackAnchor>,
     pub rendered_blocks: std::collections::BTreeMap<u64, (f64, f64)>,
 }
 impl EditorApp {
@@ -130,6 +138,7 @@ impl EditorApp {
         cc.egui_ctx.set_style_of(egui::Theme::Light, style);
         let mut editor = Self {
             catalog: crate::app::catalog::Catalog::default(),
+            catalog_load: None,
             avatar_cache: Default::default(),
             portrait_state: Default::default(),
             resources: crate::app::resources::Locations::default(),
@@ -154,12 +163,14 @@ impl EditorApp {
             error: None,
             filename: None,
             recent_projects: Default::default(),
+            window_title: "ROICEPEAK".into(),
             dirty: false,
             undo: Vec::new(),
             redo: Vec::new(),
             history_selection: None,
             phoneme_history: Default::default(),
             font_points: script_layout::DEFAULT_EM,
+            script_metrics: Default::default(),
             dictionary_ui: crate::app::dictionary::Editor::default(),
             dictionary_state: crate::app::dictionary::State::load(),
             playhead: 0.0,
@@ -174,7 +185,9 @@ impl EditorApp {
             player: crate::app::audio::Player::default(),
             rendered_audio: std::sync::Arc::default(),
             output_id: String::new(),
-            audio_outputs: crate::app::audio::outputs().unwrap_or_default(),
+            audio_outputs: Vec::new(),
+            audio_output_scan: None,
+            audio_outputs_scanned: false,
             loop_playback: false,
             shortcuts: crate::app::shortcuts::ShortcutMap::defaults(),
             shortcut_settings: false,
@@ -183,13 +196,16 @@ impl EditorApp {
             find_replace: crate::app::find_replace::FindReplace::default(),
             render_config: None,
             query_basis_current: false,
-            render_worker: crate::app::render::Worker::default(),
+            render_worker: crate::app::render::Worker::for_editor(),
             render_busy: false,
             render_status: String::new(),
             playback_generation: 0,
             playback: None,
             playback_pending: false,
             rendered_blocks: std::collections::BTreeMap::new(),
+            playback_guide: Default::default(),
+            playback_start: Default::default(),
+            pending_control_seek: None,
         };
         if let Err(error) = editor.dictionary_snapshot() {
             editor.error = Some(error);
@@ -227,7 +243,7 @@ impl EditorApp {
         if let Some(draft) = &mut self.resource_draft {
             draft.locale = locale;
         }
-        if let Err(error) = self.resources.save() {
+        if let Err(error) = self.settings_state.save_now(&self.resources) {
             self.error = Some(error);
         }
     }
@@ -247,6 +263,8 @@ impl EditorApp {
         self.playback_pending = false;
         self.rendered_audio = std::sync::Arc::default();
         self.rendered_blocks.clear();
+        self.playback_guide = Default::default();
+        self.pending_control_seek = None;
         self.render_status.clear();
     }
     pub(crate) fn poll_render(&mut self, ctx: &egui::Context) {
@@ -286,6 +304,8 @@ impl EditorApp {
             let mut ranges = std::collections::BTreeMap::new();
             let mut seen = std::collections::BTreeSet::new();
             let duration = result.pcm.len() as f64 / result.rate as f64;
+            let mut guide = crate::app::script_playback::PlaybackGuide::default();
+            guide.replace(&result.blocks);
             for rendered in result.blocks {
                 let end = rendered.start + rendered.duration;
                 if !rendered.start.is_finite()
@@ -316,11 +336,12 @@ impl EditorApp {
                 return Err("Incomplete synthesis block metadata".into());
             }
             updated.validate()?;
-            self.dirty |= updated != self.project;
             self.project = updated;
             self.query_basis_current = true;
             self.rendered_audio = result.pcm;
             self.rendered_blocks = ranges;
+            self.playback_guide = guide;
+            self.retime_control_seek();
             self.playhead = self.playhead.min(duration);
             self.render_status = format!(
                 "Ready: {} blocks, {:.2} seconds",
@@ -358,6 +379,7 @@ impl eframe::App for EditorApp {
         let context = ui.ctx().clone();
         crate::app::phoneme_history::begin_frame(&context);
         style::set_value_policy(&context, self.resources.value_policy());
+        self.poll_voice_catalog(&context);
         self.poll_preparation(&context);
         self.poll_playback(&context);
         self.poll_render(&context);
@@ -366,12 +388,13 @@ impl eframe::App for EditorApp {
         }
         self.synchronize_transport();
         let before = self.project.clone();
-        let selection_before = self.selection.clone();
         self.finish_reading_edit(&context);
         self.player.gain(self.global_volume / 100.0);
         if self.player.loaded() {
             self.playhead = self.player.position();
         }
+        self.follow_playback();
+        let selection_before = self.selection.clone();
         if self.player.is_playing() {
             context.request_repaint_after(std::time::Duration::from_millis(16));
         }
@@ -445,7 +468,7 @@ impl eframe::App for EditorApp {
                 .catalog
                 .voices
                 .iter()
-                .map(|v| (v.name.clone(), v.name.clone()))
+                .map(|voice| (voice.collection_name.clone(), voice.name.clone()))
                 .collect();
             let user_dictionary = self.dictionary_snapshot();
             self.export.show(
@@ -526,7 +549,7 @@ impl eframe::App for EditorApp {
             if let Some(draft) = &mut self.resource_draft {
                 draft.export_settings = Some(settings);
             }
-            if let Err(error) = self.resources.save() {
+            if let Err(error) = self.settings_state.save_now(&self.resources) {
                 self.error = Some(error);
             }
         }
@@ -544,14 +567,18 @@ impl eframe::App for EditorApp {
             && !crate::app::emotion_presets::active(&context);
         let root_rect = ui.max_rect();
         crate::app::root_tooltip::paint(ui, root_rect, tooltip_enabled);
-        context.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+        let title = format!(
             "ROICEPEAK{}{}",
             self.filename
                 .as_ref()
                 .map(|p| format!(" — {}", p.file_name().unwrap_or_default().to_string_lossy()))
                 .unwrap_or_default(),
             if self.dirty { " *" } else { "" }
-        )));
+        );
+        if title != self.window_title {
+            self.window_title = title.clone();
+            context.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
         let visible = frame
             .winit_window()
             .and_then(|window| window.is_visible())

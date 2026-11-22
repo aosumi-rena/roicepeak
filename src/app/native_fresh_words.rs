@@ -42,8 +42,8 @@ pub(super) fn replacement(sentence: &SentenceState) -> Result<Value, String> {
             }
             continue;
         }
-        if word.language != 1 || word.pos > i32::MAX as u32 {
-            return Err("Native Save requires Japanese authored words".into());
+        if !(1..=3).contains(&word.language) || word.pos > i32::MAX as u32 {
+            return Err("Unsupported word language or part of speech".into());
         }
         let range = sentence.word_positions.ranges[index]
             .as_ref()
@@ -77,7 +77,7 @@ pub(super) fn replacement(sentence: &SentenceState) -> Result<Value, String> {
             );
         }
         tokens.push(
-            json!({"s":word.surface,"pos":word.pos,"lang":0,"pe":word.pronunciation_edited,
+            json!({"s":word.surface,"pos":word.pos,"lang":word.language - 1,"pe":word.pronunciation_edited,
             "syl":morae,"r8":endpoints(first,last)?,"r32":endpoints(range.start,range.end)?}),
         );
     }

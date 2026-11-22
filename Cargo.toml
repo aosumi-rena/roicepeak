@@ -27,6 +27,7 @@ image = { version = "=0.25.10", default-features = false, features = ["jpeg", "p
 sha2 = { version = "=0.11.1", default-features = false }
 flacenc = { version = "=0.5.1", default-features = false }
 encoding_rs = { version = "=0.8.35" }
+pinyin = { version = "=0.11.0", default-features = false, features = ["with_tone_num_end"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 safe_arch = { version = "=1.2.0", default-features = false }

@@ -9,6 +9,8 @@ use std::{
     collections::BTreeSet,
     fs,
     path::PathBuf,
+    sync::{Arc, mpsc},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -46,6 +48,20 @@ pub struct CoreCalls {
     pub completed: usize,
     pub wall_seconds: f64,
     pub stages: CoreStages,
+}
+impl CoreCalls {
+    pub(super) fn merge(&mut self, other: Self) {
+        self.attempted += other.attempted;
+        self.completed += other.completed;
+        self.wall_seconds += other.wall_seconds;
+        self.stages.encoding_seconds += other.stages.encoding_seconds;
+        self.stages.language_seconds += other.stages.language_seconds;
+        self.stages.prosody_seconds += other.stages.prosody_seconds;
+        self.stages.controls_seconds += other.stages.controls_seconds;
+        self.stages.acoustic_seconds += other.stages.acoustic_seconds;
+        self.stages.vocoder_and_gain_seconds += other.stages.vocoder_and_gain_seconds;
+        self.stages.total_seconds += other.stages.total_seconds;
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -106,6 +122,7 @@ pub struct RenderProfile {
     pub voice_validation_seconds: f64,
     pub pcm_fast_path_hits: usize,
     pub prepared_metadata_cache_hits: usize,
+    pub playback_plan_reused: bool,
     pub text_analysis_seconds: f64,
     pub analyzed_units: usize,
     pub analysis_cache_hits: usize,
@@ -236,7 +253,7 @@ impl RenderProfile {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct Event {
     generation: u64,
     job_kind: Option<String>,
@@ -248,7 +265,7 @@ struct Event {
     edited_calls: Option<usize>,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub(super) struct Ledger {
     latest: Option<RenderProfile>,
     latest_render: Option<RenderProfile>,
@@ -256,9 +273,36 @@ pub(super) struct Ledger {
     recent_renders: Vec<RenderProfile>,
     output_loads: Vec<crate::app::audio::OutputTimings>,
     events: Vec<Event>,
+    #[serde(skip)]
+    writer: Option<mpsc::SyncSender<()>>,
 }
 
 impl Ledger {
+    pub(super) fn background(shared: &Arc<super::Shared>) {
+        let (send, receive) = mpsc::sync_channel(1);
+        let state = Arc::downgrade(shared);
+        let worker = thread::Builder::new()
+            .name("roicepeak-diagnostics".into())
+            .spawn(move || {
+                while receive.recv().is_ok() {
+                    thread::sleep(Duration::from_millis(150));
+                    let _ = receive.try_recv();
+                    let snapshot = state.upgrade().and_then(|shared| {
+                        shared.diagnostics.lock().ok().map(|ledger| ledger.clone())
+                    });
+                    let Some(mut snapshot) = snapshot else {
+                        break;
+                    };
+                    snapshot.write_report();
+                }
+            });
+        if worker.is_ok()
+            && let Ok(mut ledger) = shared.diagnostics.lock()
+        {
+            ledger.writer = Some(send);
+        }
+    }
+
     pub(super) fn record(&mut self, profile: &RenderProfile) {
         self.record_memory(profile);
         self.persist();
@@ -410,6 +454,14 @@ impl Ledger {
     }
 
     pub(super) fn persist(&mut self) {
+        if let Some(writer) = &self.writer {
+            let _ = writer.try_send(());
+        } else {
+            self.write_report();
+        }
+    }
+
+    fn write_report(&mut self) {
         let Some(path) = diagnostics_path() else {
             return;
         };

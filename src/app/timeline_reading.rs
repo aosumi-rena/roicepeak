@@ -1,11 +1,14 @@
 use super::mora::Word;
 use crate::app::{document::Block, i18n::Locale, style};
 use eframe::egui::{self, Rect, Sense, Vec2};
+use roicepeak::speech_frontend::Language;
 
 #[derive(Clone, Default)]
 pub(super) struct Editor {
     target: Option<(u64, u64, usize)>,
     text: String,
+    original: String,
+    language: Option<Language>,
     composition: super::composition::Composition,
     field_id: Option<egui::Id>,
     rect: Option<Rect>,
@@ -49,7 +52,11 @@ impl Editor {
         );
         let target = (block.id, word.sentence_id, word.token);
         let id = ui.id().with(("word-reading", target));
-        let enabled = basis_current && word.language == 1;
+        let language = Language::from_token_id(word.language);
+        let enabled = basis_current
+            && language.is_some()
+            && (language == Some(Language::Japanese)
+                || word.morae.iter().any(|mora| !mora.reading.is_empty()));
         let mut initial = false;
         if self.target != Some(target) {
             let response = ui.interact(
@@ -64,11 +71,21 @@ impl Editor {
             response.widget_info(|| {
                 egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, enabled, &word.text)
             });
-            if !response.clicked() {
+            let Some(language) = language.filter(|_| response.clicked()) else {
                 return false;
-            }
+            };
+            let Some(state) = block
+                .sentences
+                .iter()
+                .find(|sentence| sentence.id == word.sentence_id)
+                .and_then(|sentence| sentence.words.get(word.token))
+            else {
+                return false;
+            };
             self.target = Some(target);
-            self.text = word.morae.iter().map(|m| m.reading.as_str()).collect();
+            self.language = Some(language);
+            self.text = language.format_reading(&state.token().syllables);
+            self.original.clone_from(&self.text);
             self.composition = super::composition::Composition::default();
             initial = true;
             ui.memory_mut(|m| m.request_focus(id));
@@ -119,11 +136,7 @@ impl Editor {
                         *error = Some(format!(
                             "{}\n{}",
                             crate::app::i18n::tr(locale, "読みの編集", "Edit Pronunciation"),
-                            crate::app::i18n::tr(
-                                locale,
-                                "読みは仮名で入力してください。",
-                                "Please input a pronunciation using kanas."
-                            )
+                            self.pronunciation_hint(locale)
                         ));
                     }
                 }
@@ -139,6 +152,9 @@ impl Editor {
     }
 
     fn commit(&self, block: &mut Block) -> Result<bool, String> {
+        if self.text.trim() == self.original.trim() {
+            return Ok(false);
+        }
         let (block_id, sentence_id, token_index) = self.target.ok_or("No edited word")?;
         if block.id != block_id {
             return Err("Edited block changed".into());
@@ -164,7 +180,12 @@ impl Editor {
             .ok_or("Reading basis unavailable")?
             .clone();
         let word = sentence.words.get_mut(token_index).ok_or("Word changed")?;
-        let syllables = roicepeak::japanese::edit_reading(&self.text).map_err(|e| e.to_string())?;
+        let language = Language::from_token_id(word.language)
+            .filter(|language| Some(*language) == self.language)
+            .ok_or("Edited language changed")?;
+        let syllables = language
+            .edit_reading(&self.text)
+            .map_err(|error| error.to_string())?;
         let token = roicepeak::phonemes::Token {
             text: word.surface.clone(),
             language: word.language,
@@ -176,6 +197,15 @@ impl Editor {
             block.segments.clear();
         }
         Ok(changed)
+    }
+
+    fn pronunciation_hint(&self, locale: Locale) -> &'static str {
+        let message = match self.language.unwrap_or(Language::Japanese) {
+            Language::Japanese => "Please input a pronunciation using kanas.",
+            Language::Mandarin => "Enter pinyin with tone numbers, e.g. yin2 hang2.",
+            Language::English => "Enter ARPAbet with stress, e.g. HH AH0 L OW1.",
+        };
+        crate::app::i18n::text(locale, message)
     }
 }
 
@@ -221,14 +251,7 @@ pub(super) fn finish_pointer_edit(
                 match editor.commit(block) {
                     Ok(value) => changed = value,
                     Err(_) => {
-                        *error = Some(
-                            crate::app::i18n::tr(
-                                locale,
-                                "読みは仮名で入力してください。",
-                                "Please input a pronunciation using kanas.",
-                            )
-                            .into(),
-                        );
+                        *error = Some(editor.pronunciation_hint(locale).into());
                     }
                 }
             }

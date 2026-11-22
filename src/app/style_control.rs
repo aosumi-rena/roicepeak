@@ -179,6 +179,7 @@ fn parameter_row_impl(
         initial = true;
         ui.memory_mut(|memory| memory.request_focus(text_id));
     }
+    let show_label = !editor.open;
     if editor.open {
         let focused = initial || ui.memory(|memory| memory.has_focus(text_id));
         let (enter, escape) = ui.input_mut(|input| {
@@ -262,10 +263,33 @@ fn parameter_row_impl(
             }
         }
         // Report an authored change only after a successful commit.
-    } else {
-        let hovered = enabled && ui.rect_contains_pointer(rect);
-        let text = if hovered {
-            format!("{:.0} %", value.trunc())
+    }
+    ui.ctx().data_mut(|data| data.insert_temp(state_id, editor));
+    let track = Rect::from_min_size(
+        egui::pos2(rect.left() + 76.0 + padding, rect.center().y - 11.0),
+        Vec2::new((rect.width() - 76.0 - padding).max(20.0), 22.0),
+    );
+    let mut preview = *value;
+    let slider = slider_colored_mixed(
+        ui,
+        identity.with("track"),
+        track,
+        &mut preview,
+        min,
+        max,
+        default,
+        enabled,
+        name,
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 76),
+        mixed,
+        mixed && !ui.rect_contains_pointer(rect),
+        mixed_label,
+        committed,
+    );
+    let held = (slider.is_pointer_button_down_on() || slider.dragged()) && !slider.drag_stopped();
+    if show_label {
+        let text = if enabled && (held || ui.rect_contains_pointer(rect)) {
+            format!("{:.0} %", preview.trunc())
         } else {
             name.to_owned()
         };
@@ -281,25 +305,10 @@ fn parameter_row_impl(
             },
         );
     }
-    ui.ctx().data_mut(|data| data.insert_temp(state_id, editor));
-    let track = Rect::from_min_size(
-        egui::pos2(rect.left() + 76.0 + padding, rect.center().y - 11.0),
-        Vec2::new((rect.width() - 76.0 - padding).max(20.0), 22.0),
-    );
-    response.union(slider_colored_mixed(
-        ui,
-        identity.with("track"),
-        track,
-        value,
-        min,
-        max,
-        default,
-        enabled,
-        name,
-        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 76),
-        mixed,
-        mixed && !ui.rect_contains_pointer(rect),
-        mixed_label,
-        committed,
-    ))
+    if held {
+        response
+    } else {
+        *value = preview;
+        response.union(slider)
+    }
 }

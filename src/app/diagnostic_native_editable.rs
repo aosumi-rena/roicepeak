@@ -192,13 +192,7 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let locations = Locations::read(config_path)?;
     let catalog = Catalog::load_roots(&locations.voice_roots)?;
-    let mut config = Config::from_catalog(
-        locations
-            .dictionary
-            .clone()
-            .ok_or("Explicit locations require a dictionary path")?,
-        &catalog,
-    )?;
+    let mut config = Config::from_catalog(locations.dictionary.clone(), &catalog)?;
     config.value_policy = locations.value_policy();
     let original_root = NativeProject::parse(&input)?.root().clone();
     let project = project_files::read(input_path, Some(&config))?;

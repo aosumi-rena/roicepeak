@@ -1,5 +1,6 @@
 #[cfg(target_arch = "x86_64")]
 #[path = "integer8.rs"]
+#[allow(unsafe_code)]
 mod integer;
 
 use crate::{Result, dnni::Node, invalid, tensor::u32_at};

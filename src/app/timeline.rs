@@ -128,232 +128,323 @@ impl EditorApp {
             .and_then(|index| self.project.blocks.get(index))
             .map(|block| self.narrator_color(&block.narrator))
             .unwrap_or(style::TEXT);
-        let Some(block) = self.selected().and_then(|i| self.project.blocks.get_mut(i)) else {
+        let cursor = self.playback_guide.word.as_ref();
+        let playing = self.transport == crate::app::transport::Transport::Playing
+            && !self.playback_pending
+            && self.player.loaded();
+        let Some(index) = self.selected() else {
             return;
         };
+        let Some(block) = self.project.blocks.get_mut(index) else {
+            return;
+        };
+        let block_id = block.id;
+        let key = cursor
+            .filter(|word| word.block == block.id)
+            .map(|word| word.key);
         let region = Rect::from_min_max(Pos2::new(body.left() + 60.0, panel_top), body.max);
         let words = mora::words(block);
-        let content_width = 18.0
-            + words
-                .iter()
-                .map(|w| w.morae.len().max(1) as f32 * 56.0)
-                .sum::<f32>();
+        let mut right = 10.0;
+        let mut follow = None;
+        for word in &words {
+            let left = right;
+            right += word.width();
+            if key == Some(word.key()) {
+                follow = Some((word.key(), left..right));
+            }
+        }
+        let content_width = right + 8.0;
         let lane = match mode {
             Mode::Accent => "Accent",
             Mode::Intonation => "Intonation",
             Mode::Duration => "Duration",
         };
+        let mut seek = None;
         ui.scope_builder(egui::UiBuilder::new().max_rect(region), |ui| {
             ui.set_clip_rect(region.intersect(ui.clip_rect()));
-            scroll::show(ui, region, content_width, |ui, content| {
-                let mut x = content.left() + 10.0;
-                let mut accent_groups: Vec<(u64, Vec<Pos2>, f32)> = Vec::new();
-                let mut reading_editor = reading::Editor::load(ui.ctx(), block.id);
-                let mut duration_editor = duration::Editor::load(ui.ctx());
-                for word in words {
-                    let width = word.morae.len().max(1) as f32 * 56.0;
-                    let card = Rect::from_min_size(
-                        Pos2::new(x, content.top() + 16.0),
-                        Vec2::new(width, 140.0),
-                    );
-                    style::card(ui, card);
-                    let header = Rect::from_min_size(card.min, Vec2::new(width, 27.0));
-                    ui.painter().line_segment(
-                        [header.left_bottom(), header.right_bottom()],
-                        Stroke::new(1.0, style::BORDER),
-                    );
-                    ui.painter().text(
-                        header.center(),
-                        egui::Align2::CENTER_CENTER,
-                        &word.text,
-                        style::font(16.0),
-                        style::TEXT,
-                    );
-                    let mut accent_points = Vec::new();
-                    let word_hovered = ui.rect_contains_pointer(card);
-                    let word_id =
-                        ui.id()
-                            .with(("word-plot", lane, block.id, word.sentence_id, word.token));
-                    let gesture_id = word_id.with("accent-gesture");
-                    let mut shape = std::collections::hash_map::DefaultHasher::new();
-                    word.text.hash(&mut shape);
-                    word.language.hash(&mut shape);
-                    for mora in &word.morae {
-                        mora.reading.hash(&mut shape);
-                    }
-                    let shape = shape.finish();
-                    let gesture = matches!(mode, Mode::Accent | Mode::Intonation)
-                        && pointer::captured(ui, gesture_id, shape);
-                    let enabled = (self.query_basis_current || gesture)
-                        && (mode != Mode::Accent || word.language == 1)
-                        && (mode == Mode::Duration || !duration::special(block, &word));
-                    let response = ui.interact(
-                        card,
-                        word_id,
-                        if enabled && mode != Mode::Duration {
-                            Sense::click_and_drag()
-                        } else {
-                            Sense::hover()
-                        },
-                    );
-                    let edit_point = matches!(mode, Mode::Accent | Mode::Intonation)
-                        .then(|| {
-                            pointer::point(
-                                ui,
-                                &response,
-                                gesture_id,
-                                shape,
-                                enabled,
-                                card.top() + 60.0,
-                                crate::app::phoneme_history::Target {
-                                    block: block.id,
-                                    sentence: word.sentence_id,
-                                    lane: if mode == Mode::Accent {
-                                        crate::app::phoneme_history::Lane::Accent
-                                    } else {
-                                        crate::app::phoneme_history::Lane::Intonation
-                                    },
-                                },
-                            )
-                        })
-                        .flatten();
-                    response.widget_info(|| {
-                        egui::WidgetInfo::labeled(
-                            egui::WidgetType::Slider,
-                            enabled,
-                            format!("{} {lane}", word.text),
-                        )
-                    });
-                    for (column, group) in word.morae.iter().enumerate() {
-                        let cell = Rect::from_min_size(
-                            card.min + Vec2::new(column as f32 * 56.0, 28.0),
-                            Vec2::new(56.0, 110.0),
+            scroll::show(
+                ui,
+                region,
+                content_width,
+                block.id,
+                follow,
+                playing,
+                |ui, content| {
+                    let mut x = content.left() + 10.0;
+                    let mut accent_groups: Vec<(u64, Vec<Pos2>, f32)> = Vec::new();
+                    let mut curve_break = false;
+                    let mut reading_editor = reading::Editor::load(ui.ctx(), block.id);
+                    let mut duration_editor = duration::Editor::load(ui.ctx());
+                    for word in words {
+                        let width = word.width();
+                        let card = Rect::from_min_size(
+                            Pos2::new(x, content.top() + 16.0),
+                            Vec2::new(width, 140.0),
                         );
-                        if !(mode == Mode::Duration && duration::special(block, &word)) {
-                            ui.painter().text(
-                                cell.center_top() + Vec2::new(0.0, 18.0),
-                                egui::Align2::CENTER_CENTER,
-                                &group.reading,
-                                style::font(14.0),
-                                style::TEXT,
+                        style::card(ui, card);
+                        let header = Rect::from_min_size(card.min, Vec2::new(width, 27.0));
+                        if key == Some(word.key()) {
+                            ui.painter().rect_filled(
+                                header.shrink(1.0),
+                                egui::CornerRadius {
+                                    nw: 7,
+                                    ne: 7,
+                                    sw: 0,
+                                    se: 0,
+                                },
+                                accent.gamma_multiply(0.26),
                             );
                         }
-                        let id = ui.id().with((
-                            "mora",
+                        ui.painter().line_segment(
+                            [header.left_bottom(), header.right_bottom()],
+                            Stroke::new(1.0, style::BORDER),
+                        );
+                        ui.painter().text(
+                            header.center(),
+                            egui::Align2::CENTER_CENTER,
+                            &word.text,
+                            style::font(16.0),
+                            style::TEXT,
+                        );
+                        let mut accent_points = Vec::new();
+                        let word_hovered = ui.rect_contains_pointer(card);
+                        let word_id = ui.id().with((
+                            "word-plot",
                             lane,
                             block.id,
                             word.sentence_id,
                             word.token,
-                            group.index,
                         ));
-                        if mode == Mode::Duration {
-                            duration_editor.mora(
+                        if self.query_basis_current
+                            && ui
+                                .interact(header, word_id.with("seek"), Sense::click())
+                                .clicked()
+                        {
+                            seek = Some(word.key());
+                        }
+                        let gesture_id = word_id.with("accent-gesture");
+                        let mut shape = std::collections::hash_map::DefaultHasher::new();
+                        word.text.hash(&mut shape);
+                        word.language.hash(&mut shape);
+                        for mora in &word.morae {
+                            mora.reading.hash(&mut shape);
+                        }
+                        let shape = shape.finish();
+                        let gesture = matches!(mode, Mode::Accent | Mode::Intonation)
+                            && pointer::captured(ui, gesture_id, shape);
+                        let pause = duration::special(block, &word);
+                        let intonation_pause = mode == Mode::Intonation && pause;
+                        let show_reading = !pause || mode == Mode::Accent;
+                        let enabled = (self.query_basis_current || gesture)
+                            && (mode != Mode::Accent || word.language == 1)
+                            && (mode == Mode::Duration || !pause);
+                        let response = ui.interact(
+                            Rect::from_min_max(header.left_bottom(), card.max),
+                            word_id,
+                            if enabled && mode != Mode::Duration {
+                                Sense::click_and_drag()
+                            } else {
+                                Sense::hover()
+                            },
+                        );
+                        let edit_point = matches!(mode, Mode::Accent | Mode::Intonation)
+                            .then(|| {
+                                pointer::point(
+                                    ui,
+                                    &response,
+                                    gesture_id,
+                                    shape,
+                                    enabled,
+                                    card.top() + 60.0,
+                                    crate::app::phoneme_history::Target {
+                                        block: block.id,
+                                        sentence: word.sentence_id,
+                                        lane: if mode == Mode::Accent {
+                                            crate::app::phoneme_history::Lane::Accent
+                                        } else {
+                                            crate::app::phoneme_history::Lane::Intonation
+                                        },
+                                    },
+                                )
+                            })
+                            .flatten();
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Slider,
+                                enabled,
+                                format!("{} {lane}", word.text),
+                            )
+                        });
+                        for (column, group) in word.morae.iter().enumerate() {
+                            let cell = Rect::from_min_size(
+                                card.min + Vec2::new(column as f32 * 56.0, 28.0),
+                                Vec2::new(56.0, 110.0),
+                            );
+                            if show_reading {
+                                let painter = ui.painter().with_clip_rect(cell);
+                                let font = if roicepeak::speech_frontend::Language::from_token_id(
+                                    word.language,
+                                ) == Some(
+                                    roicepeak::speech_frontend::Language::English,
+                                ) {
+                                    let label = painter.layout_no_wrap(
+                                        group.reading.clone(),
+                                        style::font(14.0),
+                                        style::TEXT,
+                                    );
+                                    style::font(14.0 * (50.0 / label.size().x.max(50.0)))
+                                } else {
+                                    style::font(14.0)
+                                };
+                                painter.text(
+                                    cell.center_top() + Vec2::new(0.0, 18.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    &group.reading,
+                                    font,
+                                    style::TEXT,
+                                );
+                            }
+                            let id = ui.id().with((
+                                "mora",
+                                lane,
+                                block.id,
+                                word.sentence_id,
+                                word.token,
+                                group.index,
+                            ));
+                            if mode == Mode::Duration {
+                                if duration_editor.mora(
+                                    ui,
+                                    block,
+                                    &word,
+                                    group,
+                                    card,
+                                    cell,
+                                    id,
+                                    accent,
+                                    word_hovered,
+                                    self.query_basis_current,
+                                ) {
+                                    seek = Some(word.key());
+                                }
+                                continue;
+                            }
+                            let active = edit_point.is_some_and(|point| {
+                                point.x >= card.left()
+                                    && point.x <= card.right()
+                                    && (((point.x - card.left()) / 56.0).floor() as usize)
+                                        .min(word.morae.len().saturating_sub(1))
+                                        == column
+                            });
+                            match mode {
+                                Mode::Accent => {
+                                    let mut high = group.high;
+                                    if active {
+                                        if let Some(point) = edit_point {
+                                            high = point.y < card.top() + 95.5;
+                                            group.accent(block, high);
+                                        }
+                                    }
+                                    let point = Pos2::new(
+                                        cell.center().x,
+                                        card.top() + if high { 64.0 } else { 127.0 },
+                                    );
+                                    accent_points.push(point);
+                                }
+                                Mode::Intonation => {
+                                    if intonation_pause {
+                                        continue;
+                                    }
+                                    let mut value = group.intonation;
+                                    if active {
+                                        if let Some(point) = edit_point {
+                                            value = (card.top() + 127.0
+                                                - point
+                                                    .y
+                                                    .clamp(card.top() + 64.0, card.top() + 127.0))
+                                                / 63.0
+                                                * 6.0
+                                                - 3.0;
+                                            group.intonation(block, value);
+                                        }
+                                    }
+                                    let value = if value.is_nan() { 0.0 } else { value };
+                                    accent_points.push(Pos2::new(
+                                        cell.center().x,
+                                        card.top() + 127.0
+                                            - ((value + 3.0) / 6.0).clamp(0.0, 1.0) * 63.0,
+                                    ));
+                                }
+                                Mode::Duration => unreachable!(),
+                            }
+                        }
+                        if intonation_pause {
+                            curve_break = true;
+                        } else if matches!(mode, Mode::Accent | Mode::Intonation) {
+                            if let Some((_, points, _)) =
+                                accent_groups.last_mut().filter(|(sentence, _, _)| {
+                                    !curve_break && *sentence == word.sentence_id
+                                })
+                            {
+                                points.extend(accent_points);
+                            } else {
+                                accent_groups.push((
+                                    word.sentence_id,
+                                    accent_points,
+                                    card.bottom() - 13.0,
+                                ));
+                            }
+                            curve_break = false;
+                        }
+                        if show_reading {
+                            if reading_editor.word(
                                 ui,
                                 block,
                                 &word,
-                                group,
                                 card,
-                                cell,
-                                id,
-                                accent,
-                                word_hovered,
                                 self.query_basis_current,
+                                self.locale,
+                                &mut self.error,
+                            ) {
+                                self.query_basis_current = false;
+                            }
+                        }
+                        if mode == Mode::Duration {
+                            duration::mode(
+                                ui,
+                                block,
+                                &word,
+                                card,
+                                self.query_basis_current,
+                                accent,
                             );
-                            continue;
                         }
-                        let active = edit_point.is_some_and(|point| {
-                            point.x >= card.left()
-                                && point.x <= card.right()
-                                && (((point.x - card.left()) / 56.0).floor() as usize)
-                                    .min(word.morae.len().saturating_sub(1))
-                                    == column
-                        });
-                        match mode {
-                            Mode::Accent => {
-                                let mut high = group.high;
-                                if active {
-                                    if let Some(point) = edit_point {
-                                        high = point.y < card.top() + 95.5;
-                                        group.accent(block, high);
-                                    }
-                                }
-                                let point = Pos2::new(
-                                    cell.center().x,
-                                    card.top() + if high { 64.0 } else { 127.0 },
-                                );
-                                accent_points.push(point);
-                            }
-                            Mode::Intonation => {
-                                let mut value = group.intonation;
-                                if active {
-                                    if let Some(point) = edit_point {
-                                        value = (card.top() + 127.0
-                                            - point.y.clamp(card.top() + 64.0, card.top() + 127.0))
-                                            / 63.0
-                                            * 6.0
-                                            - 3.0;
-                                        group.intonation(block, value);
-                                    }
-                                }
-                                let value = if value.is_nan() { 0.0 } else { value };
-                                accent_points.push(Pos2::new(
-                                    cell.center().x,
-                                    card.top() + 127.0
-                                        - ((value + 3.0) / 6.0).clamp(0.0, 1.0) * 63.0,
-                                ));
-                            }
-                            Mode::Duration => unreachable!(),
-                        }
-                    }
-                    if matches!(mode, Mode::Accent | Mode::Intonation) {
-                        if let Some((_, points, _)) = accent_groups
-                            .last_mut()
-                            .filter(|(sentence, _, _)| *sentence == word.sentence_id)
-                        {
-                            points.extend(accent_points);
-                        } else {
-                            accent_groups.push((
-                                word.sentence_id,
-                                accent_points,
-                                card.bottom() - 13.0,
-                            ));
-                        }
-                    }
-                    if !(mode == Mode::Duration && duration::special(block, &word)) {
-                        if reading_editor.word(
+                        if reset::word(
                             ui,
                             block,
                             &word,
                             card,
+                            mode,
                             self.query_basis_current,
                             self.locale,
-                            &mut self.error,
                         ) {
                             self.query_basis_current = false;
                         }
+                        x += width;
                     }
-                    if mode == Mode::Duration {
-                        duration::mode(ui, block, &word, card, self.query_basis_current, accent);
+                    reading_editor.store(ui.ctx());
+                    duration_editor.store(ui.ctx());
+                    for (_, points, bottom) in accent_groups {
+                        curve::accent(ui, &points, bottom, accent);
                     }
-                    if reset::word(
-                        ui,
-                        block,
-                        &word,
-                        card,
-                        mode,
-                        self.query_basis_current,
-                        self.locale,
-                    ) {
-                        self.query_basis_current = false;
-                    }
-                    x += width;
-                }
-                reading_editor.store(ui.ctx());
-                duration_editor.store(ui.ctx());
-                for (_, points, bottom) in accent_groups {
-                    curve::accent(ui, &points, bottom, accent);
-                }
-            });
+                },
+            );
         });
+        if let Some(key) = seek
+            && let Some(time) = self.playback_guide.word_position(block_id, key)
+        {
+            self.seek_to_word(time);
+            ui.ctx().request_repaint();
+        }
     }
 }

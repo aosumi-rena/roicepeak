@@ -1,7 +1,11 @@
 use crate::app::{editor::Mode, resources::Locations};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::{
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -123,7 +127,13 @@ pub struct State {
     saved: Option<Locations>,
     pending: Option<(Locations, Instant)>,
     failed: Option<Locations>,
+    writing: Option<Write>,
     window_restore: Option<(Window, Option<Instant>)>,
+}
+
+struct Write {
+    locations: Locations,
+    result: Receiver<Result<(), String>>,
 }
 
 impl State {
@@ -171,6 +181,19 @@ impl State {
         locations: &Locations,
         ctx: &egui::Context,
     ) -> Result<(), String> {
+        if let Some(write) = &self.writing {
+            let result = match write.result.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => Err("Settings writer stopped".into()),
+            };
+            let write = self.writing.take().unwrap();
+            let current = &write.locations == locations;
+            let completed = self.finish_write(write.locations, result);
+            if current {
+                completed?;
+            }
+        }
         if self.saved.is_none() || self.saved.as_ref() == Some(locations) {
             self.pending = None;
             return Ok(());
@@ -192,22 +215,62 @@ impl State {
             ctx.request_repaint_after(delay - elapsed);
             return Ok(());
         }
-        self.flush(locations)
+        self.pending = None;
+        let snapshot = locations.clone();
+        let (send, result) = mpsc::sync_channel(1);
+        let repaint = ctx.clone();
+        match thread::Builder::new()
+            .name("roicepeak-settings".into())
+            .spawn(move || {
+                let _ = send.send(snapshot.save());
+                repaint.request_repaint();
+            }) {
+            Ok(_) => {
+                self.writing = Some(Write {
+                    locations: locations.clone(),
+                    result,
+                });
+                Ok(())
+            }
+            Err(error) => self.finish_write(locations.clone(), Err(error.to_string())),
+        }
     }
 
     pub fn flush(&mut self, locations: &Locations) -> Result<(), String> {
-        self.pending = None;
-        if self.saved.is_none() || self.saved.as_ref() == Some(locations) {
+        if self.saved.is_none() {
             return Ok(());
         }
-        match locations.save() {
+        self.save_now(locations)
+    }
+
+    pub fn save_now(&mut self, locations: &Locations) -> Result<(), String> {
+        self.pending = None;
+        if let Some(write) = self.writing.take() {
+            let result = write
+                .result
+                .recv()
+                .unwrap_or_else(|_| Err("Settings writer stopped".into()));
+            let _ = self.finish_write(write.locations, result);
+        }
+        if self.saved.as_ref() == Some(locations) {
+            return Ok(());
+        }
+        self.finish_write(locations.clone(), locations.save())
+    }
+
+    fn finish_write(
+        &mut self,
+        locations: Locations,
+        result: Result<(), String>,
+    ) -> Result<(), String> {
+        match result {
             Ok(()) => {
-                self.saved = Some(locations.clone());
+                self.saved = Some(locations);
                 self.failed = None;
                 Ok(())
             }
             Err(error) => {
-                self.failed = Some(locations.clone());
+                self.failed = Some(locations);
                 Err(format!("Cannot save settings: {error}"))
             }
         }

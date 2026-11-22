@@ -5,7 +5,7 @@ use super::{
 };
 use crate::app::{
     document::{
-        Parameters, Segment,
+        Segment,
         state::{DurationMode, DurationState},
     },
     sentences::SentenceRef,
@@ -35,12 +35,9 @@ fn phone_preview(
     raw_intonation: &[f32],
     query_timing: &[roicepeak::synthesis::PhoneTiming],
     analysis: &Analysis,
-    style_offset: f32,
     edits: &Edits,
-    invert: bool,
     sentence: &SentenceRef,
 ) -> CoreResult<PhonePreview> {
-    let _ = (style_offset, invert);
     if raw_durations.len() != encoded.references.len()
         || raw_durations.iter().any(|v| !v.is_finite() || *v < 0.0)
         || raw_intonation.iter().any(|v| !v.is_finite())
@@ -150,9 +147,7 @@ pub(super) fn preview(
     query: &PreparedQuery,
     controls: &Controls,
     analysis: &Analysis,
-    style_offset: f32,
     edits: &Edits,
-    invert: bool,
     sentence: &SentenceRef,
 ) -> CoreResult<PhonePreview> {
     phone_preview(
@@ -160,21 +155,18 @@ pub(super) fn preview(
         query.prosody(),
         &controls.values,
         query.raw_query_durations(),
-        &query.intonation_coordinates(invert),
+        &query.intonation_coordinates(true),
         &controls.phone_timing,
         analysis,
-        style_offset,
         edits,
-        invert,
         sentence,
     )
 }
 pub(super) fn unpack(
     mut render: Render,
+    unit: UnitKey,
     analysis: &Analysis,
-    style_offset: f32,
     edits: &Edits,
-    invert: bool,
     sentence: &SentenceRef,
 ) -> CoreResult<Baseline> {
     let pcm = render
@@ -200,23 +192,16 @@ pub(super) fn unpack(
         &render.raw_query_intonation,
         &render.phone_timing,
         analysis,
-        style_offset,
         edits,
-        invert,
         sentence,
     )?;
     if phones.samples != pcm.rows() {
         return Err(Error("PCM length disagrees with phone/frame timing".into()));
     }
     Ok(Baseline {
-        unit: UnitKey {
-            value_policy: edits.value_policy,
-            text: String::new(),
-            parameters: Parameters::default(),
-            project_parameters: Parameters::default(),
-            narrator_parameters: Parameters::default(),
-            scalar_layers: Default::default(),
-        },
+        unit,
+        authored: None,
+        waiting_for: None,
         dictionary: Arc::new(Vec::new()),
         voice: None,
         model_stamp: Vec::new(),

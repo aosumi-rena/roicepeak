@@ -125,12 +125,14 @@ pub(in crate::app::render) fn prepared(value: &PreparedUnit) -> usize {
 }
 
 impl CachedVoice {
-    pub(super) fn estimated_bytes(&self) -> usize {
+    pub(super) fn estimated_voice_bytes(&self) -> usize {
         arc::<Self>(sum([
             binding(&self.binding),
             path(&self.path),
             stamps(&self.stamp),
-            self.manifest.estimated_bytes(),
+            self.manifest.synth.voice_bytes(),
+            vector(&self.manifest.weights),
+            self.manifest.edits.estimated_bytes(),
         ]))
     }
 }
@@ -142,6 +144,12 @@ impl Baseline {
             parameters(&self.unit.parameters),
             parameters(&self.unit.project_parameters),
             parameters(&self.unit.narrator_parameters),
+            self.authored.as_ref().map_or(0, |value| {
+                arc::<super::AuthoredControls>(sum([
+                    vector(&value.token_signature),
+                    value.edits.estimated_bytes(),
+                ]))
+            }),
             dictionary(&self.dictionary),
             self.voice.as_ref().map_or(0, |voice| binding(voice)),
             stamps(&self.model_stamp),

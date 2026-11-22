@@ -9,8 +9,9 @@ pub use identity::{EmotionControl, EmotionMetadata, IdentityMetadata};
 mod resolve;
 mod sources;
 
-use crate::app::document::{VoiceRef, VoiceSourceInfo, resolve_source};
+use crate::app::document::{VoiceRef, VoiceSourceInfo, VoiceVersion, resolve_source};
 use crate::app::render::VoiceBinding;
+use roicepeak::speech_frontend::Language;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -33,10 +34,12 @@ pub struct Voice {
     /// Runtime resource instance key.
     pub key: String,
     pub name: String,
+    /// Narrator key stored in projects.
     pub collection_name: String,
     pub version: u32,
     pub vendor: String,
     pub languages: Vec<String>,
+    pub default_language: Option<Language>,
     pub emotions: Vec<EmotionMetadata>,
     /// Commercial-use metadata from idc.json.
     pub can_commercial: bool,
@@ -49,7 +52,7 @@ pub struct Voice {
 
 impl VoiceSourceInfo for Voice {
     fn identity(&self) -> &str {
-        &self.name
+        &self.collection_name
     }
     fn languages(&self) -> &[String] {
         &self.languages
@@ -125,25 +128,29 @@ impl Loader {
         Ok(())
     }
 
-    fn resolve(&mut self) {
+    fn resolve(&mut self, inspect_portraits: bool) {
         let resolver = inheritance::Resolver::new(&self.records);
         for (index, record) in self.records.iter().enumerate() {
             let root = resolve::Root::plain(record.root.clone());
             let path = &record.source;
             let voice = resolver.resolve(index).and_then(|resolved| {
-                metadata::load(&root, path, Arc::clone(&record.bytes), resolved)
+                metadata::load(
+                    &root,
+                    path,
+                    Arc::clone(&record.bytes),
+                    resolved,
+                    inspect_portraits,
+                )
             });
             match voice {
                 Ok(mut voice) => {
-                    if self
-                        .catalog
-                        .voices
-                        .iter()
-                        .any(|previous| previous.key == voice.key && previous.name != voice.name)
-                    {
+                    if self.catalog.voices.iter().any(|previous| {
+                        previous.key == voice.key
+                            && previous.collection_name != voice.collection_name
+                    }) {
                         use sha2::{Digest, Sha256};
                         let mut hash = Sha256::new();
-                        for field in [&voice.key, &voice.name] {
+                        for field in [&voice.key, &voice.collection_name] {
                             hash.update((field.len() as u32).to_le_bytes());
                             hash.update(field.as_bytes());
                         }
@@ -221,13 +228,21 @@ impl Loader {
 impl Catalog {
     /// Discover plain descriptions only under explicitly configured paths.
     pub fn load_roots(roots: &[PathBuf]) -> Result<Self, String> {
+        Self::load(roots, true)
+    }
+
+    pub(super) fn load_for_editor(roots: &[PathBuf]) -> Result<Self, String> {
+        Self::load(roots, false)
+    }
+
+    fn load(roots: &[PathBuf], inspect_portraits: bool) -> Result<Self, String> {
         let discovered = sources::discover(roots)?;
         let mut loader = Loader::default();
         loader.catalog.problems = discovered.problems;
         for source in discovered.candidates {
             loader.plain(source.root, source.voice)?;
         }
-        loader.resolve();
+        loader.resolve(inspect_portraits);
         if !roots.is_empty() && loader.catalog.voices.is_empty() {
             loader
                 .catalog
@@ -250,12 +265,51 @@ impl Catalog {
         let mut versions: Vec<_> = self
             .voices
             .iter()
-            .filter(|voice| {
-                voice.name == reference.identity && voice.languages.contains(&reference.language)
-            })
+            .filter(|voice| voice.collection_name == reference.identity)
             .map(|voice| voice.version)
             .collect();
         versions.sort_unstable_by(|a, b| b.cmp(a));
+        versions.dedup();
         versions
+    }
+
+    pub(crate) fn languages(
+        &self,
+        reference: &VoiceRef,
+    ) -> Vec<roicepeak::speech_frontend::Language> {
+        let mut candidate = reference.clone();
+        let mut choices: Vec<_> = [Language::Japanese, Language::Mandarin, Language::English]
+            .into_iter()
+            .filter(|language| {
+                candidate.language = language.name().to_owned();
+                self.voice(&candidate).is_some()
+            })
+            .collect();
+        let default = self.default_language(reference);
+        choices.sort_by_key(|language| Some(*language) != default);
+        choices
+    }
+
+    fn default_language(&self, reference: &VoiceRef) -> Option<Language> {
+        self.voices
+            .iter()
+            .filter(|voice| {
+                voice.collection_name == reference.identity
+                    && match reference.version {
+                        VoiceVersion::Latest => true,
+                        VoiceVersion::Exact(version) => voice.version == version,
+                    }
+            })
+            .filter_map(|voice| Some((voice.version, voice.default_language?)))
+            .reduce(|current, next| if next.0 > current.0 { next } else { current })
+            .map(|(_, language)| language)
+    }
+
+    pub(crate) fn select_available_language(&self, reference: &mut VoiceRef) {
+        if self.voice(reference).is_none()
+            && let Some(language) = self.languages(reference).first()
+        {
+            reference.language = language.name().to_owned();
+        }
     }
 }

@@ -4,7 +4,7 @@ use crate::{
     Result, dnni, invalid,
     language::CharacterCache,
     stylebook::Offsets,
-    synthesis::{Edits, Models, Parameters, Synthesizer},
+    synthesis::{Edits, Models, Parameters, Synthesizer, VoiceNodes},
     vocoder::Effects,
 };
 use std::path::PathBuf;
@@ -90,48 +90,71 @@ impl ModelResources {
 
 impl Manifest {
     pub fn from_resources(resources: &ModelResources) -> Result<Self> {
+        Self::load_resources(resources, None)
+    }
+
+    /// Rebind a voice using a manifest built from the same validated model files and effects.
+    pub fn from_resources_reusing(resources: &ModelResources, source: &Self) -> Result<Self> {
+        Self::load_resources(resources, Some(source))
+    }
+
+    fn load_resources(resources: &ModelResources, source: Option<&Self>) -> Result<Self> {
         if resources.stylebook.is_empty() || resources.stylebook.len() > 16 * 1024 * 1024 {
             return Err(invalid("catalog stylebook byte limit"));
         }
-        let data = [
-            &resources.phonemes,
-            &resources.language,
-            &resources.intonation,
-            &resources.accent,
-            &resources.acoustic,
-            &resources.vocoder,
-        ]
-        .into_iter()
-        .map(|p| bytes(p, dnni::MAX_BYTES))
-        .collect::<Result<Vec<_>>>()?;
-        let roots = data
-            .iter()
-            .map(|b| dnni::parse(b))
-            .collect::<Result<Vec<_>>>()?;
+        let intonation = bytes(&resources.intonation, dnni::MAX_BYTES)?;
+        let accent = bytes(&resources.accent, dnni::MAX_BYTES)?;
+        let acoustic = bytes(&resources.acoustic, dnni::MAX_BYTES)?;
+        let intonation = dnni::parse(&intonation)?;
+        let accent = dnni::parse(&accent)?;
+        let acoustic = dnni::parse(&acoustic)?;
         let stylebook = dnni::parse(&resources.stylebook)?;
-        let mut synth = Synthesizer::compile(
-            Models {
-                phonemes: &roots[0],
-                language: &roots[1],
-                intonation: &roots[2],
-                accent: &roots[3],
-                acoustic: &roots[4],
-                vocoder: &roots[5],
-                stylebook: &stylebook,
-            },
-            resources.speaker,
-            resources.offsets.clone(),
-            resources.style_phonemes.clone(),
-            resources.speaker_vector.as_deref(),
-        )?;
-        synth.set_vocoder_effects(resources.vocoder_effects.clone());
-        if let Some(cache) = &resources.character_cache {
-            synth.set_character_cache(CharacterCache::parse(
-                &bytes(&cache.descriptor, 65_536)?,
-                &bytes(&cache.keys, 16 * 1024 * 1024)?,
-                &bytes(&cache.data, crate::tensor::MAX_ELEMENTS * 4)?,
-            )?)?;
-        }
+        let offsets = resources.offsets.clone();
+        let phones = resources.style_phonemes.clone();
+        let speaker = resources.speaker;
+        let vector = resources.speaker_vector.as_deref();
+        let synth = if let Some(source) = source {
+            source.synth.rebind_models(
+                VoiceNodes {
+                    acoustic: &acoustic,
+                    intonation: &intonation,
+                    accent: &accent,
+                    stylebook: &stylebook,
+                },
+                speaker,
+                offsets,
+                phones,
+                vector,
+            )?
+        } else {
+            let phonemes = bytes(&resources.phonemes, dnni::MAX_BYTES)?;
+            let language = bytes(&resources.language, dnni::MAX_BYTES)?;
+            let vocoder = bytes(&resources.vocoder, dnni::MAX_BYTES)?;
+            let mut synth = Synthesizer::compile(
+                Models {
+                    phonemes: &dnni::parse(&phonemes)?,
+                    language: &dnni::parse(&language)?,
+                    intonation: &intonation,
+                    accent: &accent,
+                    acoustic: &acoustic,
+                    vocoder: &dnni::parse(&vocoder)?,
+                    stylebook: &stylebook,
+                },
+                speaker,
+                offsets,
+                phones,
+                vector,
+            )?;
+            synth.set_vocoder_effects(resources.vocoder_effects.clone());
+            if let Some(cache) = &resources.character_cache {
+                synth.set_character_cache(CharacterCache::parse(
+                    &bytes(&cache.descriptor, 65_536)?,
+                    &bytes(&cache.keys, 16 * 1024 * 1024)?,
+                    &bytes(&cache.data, crate::tensor::MAX_ELEMENTS * 4)?,
+                )?)?;
+            }
+            synth
+        };
         if resources.weights.len() != synth.emotions().len()
             || resources.weights.iter().any(|v| !v.is_finite())
         {

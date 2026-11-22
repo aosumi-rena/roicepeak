@@ -41,10 +41,13 @@ impl Catalog {
         let mut order = Vec::new();
         let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (index, voice) in self.voices.iter().enumerate() {
-            if !groups.contains_key(&voice.name) {
-                order.push(voice.name.clone());
+            if !groups.contains_key(&voice.collection_name) {
+                order.push(voice.collection_name.clone());
             }
-            groups.entry(voice.name.clone()).or_default().push(index);
+            groups
+                .entry(voice.collection_name.clone())
+                .or_default()
+                .push(index);
         }
         self.identities.clear();
         for identity in &order {

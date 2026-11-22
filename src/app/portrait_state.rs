@@ -4,7 +4,11 @@ use crate::app::{
     document::{Block, Parameters},
 };
 use eframe::egui;
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
+};
 const MAX_BLOCK_CHOICES: usize = 10_000;
 const MAX_NARRATOR_CHOICES: usize = 256;
 const MAX_IMAGES: usize = 16;
@@ -26,6 +30,12 @@ struct Entry {
     uri: Option<String>,
     problem: Option<String>,
 }
+struct PendingImage {
+    source: u64,
+    emotion: String,
+    obsolete: bool,
+    result: Receiver<Result<Option<Portrait>, String>>,
+}
 pub(super) struct Loaded {
     pub(super) portrait: Portrait,
     pub(super) uri: String,
@@ -37,6 +47,7 @@ pub struct State {
     narrator_choices: BTreeMap<String, String>,
     scope: Scope,
     images: Vec<Entry>,
+    pending_image: Option<PendingImage>,
     reset_images: bool,
     pub last_problem: Option<String>,
 }
@@ -50,6 +61,9 @@ impl State {
     /// Image-loader cleanup is deferred to the next paint, where a Context exists.
     pub fn clear_resources(&mut self) {
         self.reset_images = true;
+        if let Some(pending) = &mut self.pending_image {
+            pending.obsolete = true;
+        }
         self.clear_choices();
         self.last_problem = None;
     }
@@ -138,6 +152,21 @@ impl State {
             self.reset_images = false;
         }
         let source = voice.portrait_sources.identity();
+        if let Some(result) =
+            self.pending_image
+                .as_ref()
+                .and_then(|pending| match pending.result.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => Some(Err("Portrait loader stopped".into())),
+                    Err(TryRecvError::Empty) => None,
+                })
+            && let Some(pending) = self.pending_image.take()
+            && !pending.obsolete
+            && pending.source == source
+            && pending.emotion == emotion
+        {
+            return self.remember(ctx, voice, emotion, result);
+        }
         if let Some(entry) = self
             .images
             .iter()
@@ -150,14 +179,44 @@ impl State {
                 .zip(entry.uri.clone())
                 .map(|(portrait, uri)| Loaded { portrait, uri });
         }
-        let result = if voice.binding.main_emotion.as_deref() == Some(emotion) {
-            voice.portrait_main.clone().map_or_else(
-                || voice.portrait_sources.load(emotion),
-                |image| Ok(Some(image)),
-            )
-        } else {
-            voice.portrait_sources.load(emotion)
-        };
+        if voice.binding.main_emotion.as_deref() == Some(emotion)
+            && let Some(image) = &voice.portrait_main
+        {
+            return self.remember(ctx, voice, emotion, Ok(Some(image.clone())));
+        }
+        self.last_problem = None;
+        if self.pending_image.is_none() {
+            let (send, result) = mpsc::sync_channel(1);
+            let portraits = voice.portrait_sources.clone();
+            let key = emotion.to_owned();
+            let repaint = ctx.clone();
+            let worker = thread::Builder::new()
+                .name("roicepeak-portrait".into())
+                .spawn(move || {
+                    let _ = send.send(portraits.load(&key));
+                    repaint.request_repaint();
+                });
+            if let Err(error) = worker {
+                return self.remember(ctx, voice, emotion, Err(error.to_string()));
+            }
+            self.pending_image = Some(PendingImage {
+                source,
+                emotion: emotion.to_owned(),
+                obsolete: false,
+                result,
+            });
+        }
+        None
+    }
+
+    fn remember(
+        &mut self,
+        ctx: &egui::Context,
+        voice: &Voice,
+        emotion: &str,
+        result: Result<Option<Portrait>, String>,
+    ) -> Option<Loaded> {
+        let source = voice.portrait_sources.identity();
         let (mut portrait, mut problem) = match result {
             Ok(image) => (image, None),
             Err(error) => (None, Some(error)),

@@ -8,7 +8,7 @@ use std::{
 struct Job {
     generation: u64,
     project: Project,
-    dictionary_path: PathBuf,
+    dictionary_path: Option<PathBuf>,
     dictionary: Snapshot,
 }
 
@@ -51,7 +51,7 @@ impl Worker {
     pub(crate) fn submit(
         &mut self,
         project: Project,
-        dictionary_path: PathBuf,
+        dictionary_path: Option<PathBuf>,
         dictionary: Snapshot,
     ) -> Result<u64, String> {
         if let Some(error) = &self.start_error {
@@ -123,7 +123,7 @@ fn run(shared: Arc<Shared>) {
             dictionary,
         } = job;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::app::save_lexical::prepare(&project, &dictionary_path, &dictionary)
+            crate::app::save_lexical::prepare(&project, dictionary_path.as_deref(), &dictionary)
         }))
         .unwrap_or_else(|_| Err("Lexical save preparation failed".into()));
         drop(project);

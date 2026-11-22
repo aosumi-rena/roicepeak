@@ -231,7 +231,7 @@ pub(crate) fn show_popup(
         let Some(voice) = app
             .catalog
             .instance(key)
-            .filter(|voice| options.excluded_identity != Some(voice.name.as_str()))
+            .filter(|voice| options.excluded_identity != Some(voice.collection_name.as_str()))
         else {
             continue;
         };

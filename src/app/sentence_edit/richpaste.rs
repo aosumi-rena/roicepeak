@@ -263,7 +263,8 @@ impl Editor {
         }
         let mut combined = destination.text.clone();
         combined.insert_str(at[caret], &fragment.text);
-        let partitions = crate::app::sentences::partition(&combined);
+        let partitions =
+            crate::app::sentences::partition_for_language(&combined, &self.block.narrator.language);
         if partitions.len() < 2 {
             self.merge(index, fragment, caret as i32)?;
             return Ok(index);

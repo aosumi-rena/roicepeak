@@ -422,40 +422,42 @@ impl Prosody {
         input: &Tensor,
         lm: &Tensor,
         words: &[usize],
-        predict: Option<&[bool]>,
+        authored: Option<(&[bool], &[u32])>,
         edited: Option<&[u32]>,
         speaker_im: &[f32],
         speaker_accent: &[f32],
         style: &[f32],
         budget: &mut Budget,
     ) -> Result<Tensor> {
-        if predict.is_some_and(|mask| mask.len() != input.rows()) {
+        if authored
+            .is_some_and(|(mask, codes)| mask.len() != input.rows() || codes.len() != input.rows())
+        {
             return Err(invalid("prosody prediction mask dimensions"));
         }
         let analysis = self.im.analyze(input, lm, words, budget)?;
-        let policy = predict
-            .map(|mask| {
-                mask.iter()
-                    .enumerate()
-                    .map(|(t, predict)| {
-                        if *predict {
-                            Ok(analysis.codes[t])
-                        } else {
-                            self.format.decode(&input.row(t)[2..])
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .transpose()?;
+        let policy = authored.map(|(mask, supplied)| {
+            mask.iter()
+                .zip(supplied)
+                .zip(&analysis.codes)
+                .map(|((&predict, &code), &estimate)| if predict { estimate } else { code })
+                .collect::<Vec<_>>()
+        });
         let codes = edited.unwrap_or_else(|| policy.as_deref().unwrap_or(&analysis.codes));
-        let changed = codes != analysis.codes;
-        let features = if changed {
-            self.format.recode(input, codes)?
+        let recoded = if codes != analysis.codes {
+            Some(self.format.recode(input, codes)?)
         } else {
-            input.clone()
+            None
         };
-        let refreshed = if changed {
-            Some(self.im.analyze(&features, lm, words, budget)?)
+        let recoded = recoded.as_ref().filter(|features| {
+            features
+                .values()
+                .iter()
+                .zip(input.values())
+                .any(|(left, right)| left.to_bits() != right.to_bits())
+        });
+        let features = recoded.unwrap_or(input);
+        let refreshed = if recoded.is_some() {
+            Some(self.im.analyze(features, lm, words, budget)?)
         } else {
             None
         };
@@ -467,10 +469,25 @@ impl Prosody {
         )?;
         let base = self
             .accent
-            .run(&features, &analysis.codes, speaker_accent, style, budget)?;
-        let edit = self
-            .accent
-            .run(&features, codes, speaker_accent, style, budget)?;
+            .run(features, &analysis.codes, speaker_accent, style, budget)?;
+        let japanese = self.format.japanese as f32;
+        let changed_japanese =
+            codes
+                .iter()
+                .zip(&analysis.codes)
+                .enumerate()
+                .any(|(index, (edited, original))| {
+                    edited != original && features.row(index)[1] == japanese
+                });
+        let edit = if changed_japanese {
+            Some(
+                self.accent
+                    .run(features, codes, speaker_accent, style, budget)?,
+            )
+        } else {
+            None
+        };
+        let edit = edit.as_ref().unwrap_or(&base);
         Tensor::new(
             input.rows(),
             3,

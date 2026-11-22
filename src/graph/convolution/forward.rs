@@ -6,6 +6,9 @@ use crate::{
 
 #[path = "row.rs"]
 mod ordered;
+#[allow(unsafe_code)]
+#[path = "paired.rs"]
+mod paired;
 
 #[derive(Debug)]
 pub(super) struct ForwardFloat {
@@ -163,9 +166,15 @@ impl ForwardFloat {
         let macs = frames
             .checked_mul(macs_per_row)
             .ok_or_else(|| invalid("float convolution arithmetic overflow"))?;
-        let plan = FallibleRows::new(frames, macs_per_row);
         let workspace_elements = checked_elements(self.kernel, self.inputs)?;
-        let all_workspaces = checked_elements(plan.chunks(), workspace_elements)?;
+        let rows_per_call = if frames > 1 && self.inputs >= 16 && self.outputs >= 64 {
+            2
+        } else {
+            1
+        };
+        let plan = FallibleRows::grouped(frames, macs_per_row, rows_per_call);
+        let workspace = checked_elements(workspace_elements, rows_per_call)?;
+        let all_workspaces = checked_elements(plan.chunks(), workspace)?;
         let elements = output_elements
             .checked_add(all_workspaces)
             .ok_or_else(|| invalid("float convolution allocation overflow"))?;
@@ -174,45 +183,61 @@ impl ForwardFloat {
         if frames == 0 {
             return Ok(output);
         }
-        plan.execute(output.values_mut(), self.outputs, |first, target| {
-            let mut queued = vec![0.0; workspace_elements];
-            for (offset, row) in target.chunks_exact_mut(self.outputs).enumerate() {
-                let time = first_output + first + offset;
-                for tap in 0..self.kernel {
-                    let at = time
-                        .checked_mul(step)
-                        .and_then(|n| tap.checked_mul(dilation).and_then(|k| n.checked_add(k)))
-                        .ok_or_else(|| invalid("float convolution input index overflow"))?;
-                    let slice = &mut queued[tap * self.inputs..(tap + 1) * self.inputs];
-                    if let Some(source) = at.checked_sub(padding).filter(|n| *n < received) {
-                        let local = source
-                            .checked_sub(origin)
-                            .filter(|n| *n < input.len() / self.inputs)
-                            .ok_or_else(|| invalid("float convolution retained input range"))?;
-                        slice.copy_from_slice(
-                            &input[local * self.inputs..(local + 1) * self.inputs],
-                        );
-                    } else {
-                        slice.fill(0.0);
-                    }
+        let load = |time: usize, queued: &mut [f32]| -> Result<()> {
+            for (tap, slice) in queued.chunks_exact_mut(self.inputs).enumerate() {
+                let at = time
+                    .checked_mul(step)
+                    .and_then(|n| tap.checked_mul(dilation).and_then(|k| n.checked_add(k)))
+                    .ok_or_else(|| invalid("float convolution input index overflow"))?;
+                if let Some(source) = at.checked_sub(padding).filter(|n| *n < received) {
+                    let local = source
+                        .checked_sub(origin)
+                        .filter(|n| *n < input.len() / self.inputs)
+                        .ok_or_else(|| invalid("float convolution retained input range"))?;
+                    slice.copy_from_slice(&input[local * self.inputs..(local + 1) * self.inputs]);
+                } else {
+                    slice.fill(0.0);
                 }
-                if !ordered::row(
-                    &self.coefficients,
-                    self.stride,
-                    self.inputs,
-                    self.kernel,
-                    &queued,
-                    self.inputs,
-                    true,
-                    row,
-                    None,
-                ) {
+            }
+            Ok(())
+        };
+        plan.execute(output.values_mut(), self.outputs, |first, target| {
+            let mut queued = vec![0.0; workspace];
+            let (left, right) = queued.split_at_mut(workspace_elements);
+            for (offset, rows) in target.chunks_mut(self.outputs * rows_per_call).enumerate() {
+                let time = first_output + first + offset * rows_per_call;
+                load(time, left)?;
+                let (front, next) = rows.split_at_mut(self.outputs);
+                let valid = if next.is_empty() {
+                    ordered::row(
+                        &self.coefficients,
+                        self.stride,
+                        self.inputs,
+                        self.kernel,
+                        left,
+                        self.inputs,
+                        true,
+                        front,
+                        None,
+                    )
+                } else {
+                    load(time + 1, right)?;
+                    paired::row(
+                        &self.coefficients,
+                        self.stride,
+                        self.inputs,
+                        self.kernel,
+                        [left, right],
+                        [front, next],
+                    )
+                };
+                if !valid {
                     return Err(invalid(
                         "float convolution product dimensions or CPU features are unavailable",
                     ));
                 }
                 if let Some(bias) = bias {
-                    for (value, bias) in row.iter_mut().zip(bias) {
+                    for (value, bias) in rows.iter_mut().zip(bias.iter().cycle()) {
                         *value = *bias + *value;
                     }
                 }

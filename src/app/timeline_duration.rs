@@ -42,7 +42,7 @@ impl Editor {
         color: Color32,
         word_hovered: bool,
         enabled: bool,
-    ) {
+    ) -> bool {
         let enabled = enabled && ui.is_enabled();
         if !enabled {
             self.target = None;
@@ -50,7 +50,7 @@ impl Editor {
             self.composition = super::composition::Composition::default();
         }
         let Some(mut duration) = mora.duration else {
-            return;
+            return false;
         };
         let center = cell.center().x;
         let drag_enabled = enabled && crate::app::phoneme_history::allowed(ui.ctx());
@@ -142,7 +142,7 @@ impl Editor {
         let visible = absolute || word_hovered || dragging || self.target == Some(id);
         if !visible {
             paint::bar(ui, card, cell, duration, color, false, false);
-            return;
+            return false;
         }
         let number = if absolute {
             format!("{:.0}", (duration.value * 1000.0).round())
@@ -295,7 +295,7 @@ impl Editor {
                 font,
                 if word_hovered { color } else { style::TEXT },
             );
-            return;
+            return false;
         }
         let field_id = id.with("input");
         self.field_id = Some(field_id);
@@ -354,6 +354,7 @@ impl Editor {
                 ui.memory_mut(|m| m.surrender_focus(field_id));
             }
         }
+        initial
     }
 }
 

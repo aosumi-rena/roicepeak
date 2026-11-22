@@ -6,19 +6,30 @@ use crate::{
 };
 use std::collections::BTreeMap;
 
-#[derive(Default)]
-pub(super) struct Trace(BTreeMap<&'static str, (usize, Vec<f32>)>);
+pub(super) struct Trace {
+    intermediates: bool,
+    stages: BTreeMap<&'static str, (usize, Vec<f32>)>,
+}
 
 impl Trace {
+    pub(super) fn new(intermediates: bool) -> Self {
+        Self {
+            intermediates,
+            stages: BTreeMap::new(),
+        }
+    }
+
     pub(super) fn push(
         &mut self,
         name: &'static str,
         input: Option<&Tensor>,
         budget: &mut Budget,
     ) -> Result<()> {
-        if let Some(input) = input {
+        if (self.intermediates || name == "pcm")
+            && let Some(input) = input
+        {
             let (columns, values) = self
-                .0
+                .stages
                 .entry(name)
                 .or_insert_with(|| (input.cols(), Vec::new()));
             if *columns != input.cols() {
@@ -32,7 +43,7 @@ impl Trace {
     }
 
     pub(super) fn finish(self) -> Result<BTreeMap<&'static str, Tensor>> {
-        self.0
+        self.stages
             .into_iter()
             .map(|(name, (columns, values))| {
                 Ok((name, Tensor::new(values.len() / columns, columns, values)?))

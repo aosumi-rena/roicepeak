@@ -32,11 +32,7 @@ impl ValuePolicy {
 
     pub fn nonnegative_limits(self, min: f32, max: f32) -> (f32, f32) {
         (
-            if self.allow_negative || self.allow_out_of_range {
-                0.0
-            } else {
-                min.max(0.0)
-            },
+            min.max(0.0),
             if self.allow_out_of_range {
                 max * 2.0
             } else {

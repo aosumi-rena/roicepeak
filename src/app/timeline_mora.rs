@@ -1,4 +1,5 @@
 use crate::app::document::{Block, state};
+use roicepeak::{phonemes::Syllable, speech_frontend::Language};
 use std::{collections::HashMap, ops::Range};
 
 pub(super) struct Word {
@@ -28,6 +29,19 @@ struct Projection {
     intonation: f32,
     raw_intonation: f32,
     raw_duration: Option<(usize, f64)>,
+}
+
+impl Word {
+    pub(super) fn key(&self) -> crate::app::script_playback::WordKey {
+        crate::app::script_playback::WordKey {
+            sentence: self.sentence_id,
+            token: self.token,
+        }
+    }
+
+    pub(super) fn width(&self) -> f32 {
+        self.morae.len().max(1) as f32 * 56.0
+    }
 }
 
 pub(super) fn words(block: &Block) -> Vec<Word> {
@@ -88,9 +102,25 @@ pub(super) fn words(block: &Block) -> Vec<Word> {
                         .and_then(|p| p.raw_duration)
                         .filter(|(phone, _)| Some(*phone) == first)
                         .map(|(_, value)| value);
+                    let reading = match Language::from_token_id(word.language) {
+                        Some(Language::English) => mora
+                            .phones
+                            .iter()
+                            .map(|phone| phone.symbol.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        Some(Language::Mandarin) => {
+                            Language::Mandarin.format_reading(&[Syllable {
+                                reading: mora.reading.clone(),
+                                code: mora.code,
+                                phones: Vec::new(),
+                            }])
+                        }
+                        _ => mora.reading.clone(),
+                    };
                     Mora {
                         index,
-                        reading: mora.reading.clone(),
+                        reading,
                         high: projection.map_or(mora.code == roicepeak::phonemes::HIGH, |p| p.high),
                         intonation: projection
                             .map_or(mora.intonation_delta + raw_intonation, |p| p.intonation),

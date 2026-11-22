@@ -74,15 +74,7 @@ impl GeneratedActivation {
                 Kind::Tanh => math::Kind::Tanh,
                 Kind::Sigmoid => math::Kind::Sigmoid,
             };
-            for target in values.chunks_mut(4) {
-                let mut source = [0.0; 4];
-                source[..target.len()].copy_from_slice(target);
-                let mut output = [0.0; 4];
-                self.kernel
-                    .apply(kind, &source, &mut output)
-                    .map_err(|_| invalid("activation row length mismatch"))?;
-                target.copy_from_slice(&output[..target.len()]);
-            }
+            self.kernel.apply_in_place(kind, values);
             if values.iter().any(|value| !value.is_finite()) {
                 return Err(invalid("nonfinite generated activation result"));
             }

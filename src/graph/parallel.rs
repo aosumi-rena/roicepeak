@@ -3,11 +3,11 @@ use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use std::sync::OnceLock;
 
 const MAX_THREADS: usize = 8;
-const MIN_PARALLEL_MACS: usize = 2 * 1024 * 1024;
+pub(super) const MIN_PARALLEL_MACS: usize = 2 * 1024 * 1024;
 const MIN_TASK_MACS: usize = 256 * 1024;
 static POOL: OnceLock<Option<ThreadPool>> = OnceLock::new();
 
-fn pool() -> Option<&'static ThreadPool> {
+pub(super) fn pool() -> Option<&'static ThreadPool> {
     POOL.get_or_init(|| {
         let threads = std::thread::available_parallelism()
             .ok()?
@@ -34,6 +34,10 @@ pub(super) struct FallibleRows {
 
 impl FallibleRows {
     pub(super) fn new(rows: usize, macs_per_row: usize) -> Self {
+        Self::grouped(rows, macs_per_row, 1)
+    }
+
+    pub(super) fn grouped(rows: usize, macs_per_row: usize, rows_per_group: usize) -> Self {
         if rows < 8 || rows.saturating_mul(macs_per_row) < MIN_PARALLEL_MACS {
             return Self {
                 rows,
@@ -49,8 +53,10 @@ impl FallibleRows {
             };
         };
         let grain = rows
+            .div_ceil(rows_per_group)
             .div_ceil(pool.current_num_threads() * 2)
-            .max(MIN_TASK_MACS.div_ceil(macs_per_row.max(1)))
+            .max(MIN_TASK_MACS.div_ceil(macs_per_row.saturating_mul(rows_per_group).max(1)))
+            .saturating_mul(rows_per_group)
             .min(rows);
         Self {
             rows,

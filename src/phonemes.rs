@@ -257,6 +257,62 @@ impl PhonemeEncoder {
             .position(|s| s.name.contains(name))
             .ok_or_else(|| invalid("language missing from phone formatter"))
     }
+
+    pub(crate) fn mandarin_without_tones(&self) -> Option<usize> {
+        self.language_without_prosody(2, &["man1", "man2", "man3", "man4"])
+    }
+
+    pub(crate) fn english_without_stress(&self) -> Option<usize> {
+        self.language_without_prosody(3, &["en0", "en1", "en2"])
+    }
+
+    fn language_without_prosody(&self, language: u32, categories: &[&str]) -> Option<usize> {
+        if self.legacy {
+            return None;
+        }
+        let accent = &self.tables[self.categorical.iter().position(|column| *column == 2)?];
+        if categories.iter().any(|name| accent.contains_key(*name)) {
+            return None;
+        }
+        self.language(language).ok()
+    }
+
+    pub(crate) fn acoustic_features(&self, encoded: &Encoded) -> Option<Tensor> {
+        let mandarin = self.mandarin_without_tones().map(|index| index as f32);
+        let english = self.english_without_stress().map(|index| index as f32);
+        let tags = self.categorical.iter().position(|column| *column == 0)?;
+        let noun = self.tables[tags].get("名詞")?;
+        let accent = self.categorical.iter().position(|column| *column == 2)?;
+        let low = self.tables[accent].get("L")?;
+        let high = self.tables[accent].get("H")?;
+        let pos_column = 2 + self.offsets[tags];
+        let accent_column = 2 + self.offsets[accent];
+        let mut features = None;
+        for (index, symbol) in encoded.symbols.iter().enumerate() {
+            let language = Some(encoded.linguistic.row(index)[1]);
+            if (language != mandarin && language != english)
+                || matches!(symbol.as_str(), "sil" | "pau")
+            {
+                continue;
+            }
+            let row = features
+                .get_or_insert_with(|| encoded.linguistic.clone())
+                .row_mut(index);
+            row[pos_column] = 0.0;
+            row[pos_column + noun] = 1.0;
+            if encoded.nucleus[index] {
+                let accent = match encoded.codes[index] {
+                    0x3001 | 0x3002 | 0x3004 | 0x4001 | 0x4002 => high,
+                    0x3000 | 0x3003 | 0x4000 => low,
+                    _ => continue,
+                };
+                row[accent_column] = 0.0;
+                row[accent_column + accent] = 1.0;
+            }
+        }
+        features
+    }
+
     pub fn encode(&self, tokens: &[Token]) -> Result<Encoded> {
         if tokens.len() > 4096 {
             return Err(invalid("too many tokens"));
@@ -271,6 +327,11 @@ impl PhonemeEncoder {
         for (t, token) in tokens.iter().enumerate() {
             if token.syllables.len() > 100_000 {
                 return Err(invalid("too many syllables"));
+            }
+            if self.legacy && matches!(token.language, 2 | 3) {
+                return Err(invalid(
+                    "This voice model does not support the selected language",
+                ));
             }
             if !self.legacy && !(1..=3).contains(&token.language) {
                 slot += token.syllables.len();
@@ -319,10 +380,16 @@ impl PhonemeEncoder {
                             .position(|s| s == &phone.symbol)
                             .map(|i| set.mapped[i].as_str())
                             .unwrap_or(&phone.symbol);
-                        self.unified
-                            .get(mapped)
-                            .copied()
-                            .unwrap_or(self.unified["sil"])
+                        match self.unified.get(mapped) {
+                            Some(&id) => id,
+                            None if token.language == 1 => self.unified["sil"],
+                            None => {
+                                return Err(invalid(format!(
+                                    "Unsupported phoneme {:?} in voice model",
+                                    phone.symbol
+                                )));
+                            }
+                        }
                     };
                     let mut row = vec![0.0; self.width + 2];
                     row[0] = phone_id as f32;

@@ -117,6 +117,30 @@ impl WordPositions {
         if analysis.input_ranges.len() != analysis.tokens.len() {
             return Err("Analysis word positions do not match its tokens".into());
         }
+        if analysis.input_text.as_deref() == Some(text) {
+            let boundaries = text_boundaries(text)?;
+            let scalar = |offset| {
+                boundaries
+                    .binary_search(&offset)
+                    .map_err(|_| "Analysis word position is not a character boundary".to_owned())
+            };
+            let ranges = analysis
+                .input_ranges
+                .iter()
+                .map(|range| {
+                    range
+                        .as_ref()
+                        .map(|range| Ok(scalar(range.start)?..scalar(range.end)?))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let raw_ranges = signed_ranges(&ranges)?;
+            return Ok(Self {
+                source: text.to_owned(),
+                ranges,
+                raw_ranges,
+            });
+        }
         let normalized = roicepeak::japanese::normalize_with_origins_excluding(
             text,
             &analysis.normalization_exclusions,

@@ -163,6 +163,12 @@ impl State {
     pub(crate) fn forget_preparation(&mut self) {
         self.prepared = None;
     }
+    pub(crate) fn prepared_playback(
+        &self,
+        request: &render::Request,
+    ) -> Option<Arc<render::PreparedProject>> {
+        self.prepared.as_ref()?.playback(request)
+    }
     pub fn open(&mut self, scope: Scope, settings: &Settings) {
         if self.running.is_none() {
             self.settings = settings.clone();

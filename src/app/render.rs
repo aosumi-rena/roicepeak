@@ -4,6 +4,7 @@ mod config;
 mod edits;
 mod engine;
 mod playback_unit;
+mod playback_work;
 mod preparation;
 mod profiling;
 mod progress;
@@ -24,10 +25,18 @@ use std::time::Instant;
 pub use streaming::Playback;
 pub const SAMPLE_RATE: u32 = 48_000;
 const MAX_AUDIO: usize = SAMPLE_RATE as usize * 60 * 10;
+#[derive(Clone)]
 pub struct Request {
     pub config: Config,
     pub project: Project,
     pub user_dictionary: crate::app::dictionary::Snapshot,
+}
+impl Request {
+    fn same_inputs(&self, other: &Self) -> bool {
+        self.project.same_content(&other.project)
+            && self.config == other.config
+            && self.user_dictionary.same(&other.user_dictionary)
+    }
 }
 pub struct Rendered {
     pub pcm: Arc<Vec<f32>>,
@@ -46,6 +55,18 @@ pub struct PreparedProject {
     pub units: Vec<PreparedSentence>,
     pub profile: RenderProfile,
     pub samples: usize,
+}
+impl PreparedProject {
+    pub(crate) fn matches(
+        &self,
+        source: &Project,
+        config: &Config,
+        dictionary: &crate::app::dictionary::Snapshot,
+    ) -> bool {
+        self.source.same_content(source)
+            && self.config == *config
+            && self.user_dictionary.same(dictionary)
+    }
 }
 /// Original sentence address and placement.
 #[derive(Clone)]
@@ -113,11 +134,13 @@ impl JobKind {
 struct Job {
     generation: u64,
     kind: JobKind,
-    request: Request,
+    request: Arc<Request>,
     submitted: Instant,
     profile: RenderProfile,
     playback_start: f64,
     playback_block: Option<u64>,
+    prepared_playback: Option<Arc<PreparedProject>>,
+    awaiting_preparation: Option<u64>,
     progress: Option<progress::Reporter>,
 }
 #[derive(Default)]
@@ -125,6 +148,7 @@ struct Pending {
     render: Option<Job>,
     prepare: Option<Job>,
     playback: Option<Job>,
+    active_preparation: Option<(u64, Arc<Request>)>,
 }
 impl Pending {
     fn take(&mut self) -> Option<Job> {
@@ -132,6 +156,14 @@ impl Pending {
             .take()
             .or_else(|| self.playback.take())
             .or_else(|| self.prepare.take())
+    }
+
+    fn take_for_work(&mut self) -> Option<Job> {
+        let job = self.take()?;
+        if job.kind == JobKind::Prepare {
+            self.active_preparation = Some((job.generation, Arc::clone(&job.request)));
+        }
+        Some(job)
     }
 }
 #[derive(Default)]

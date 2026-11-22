@@ -327,9 +327,13 @@ impl EditorApp {
         locations.dictionary = draft.dictionary;
         locations.show_portrait = draft.show_portrait;
         locations.validate()?;
-        locations.save()?;
+        self.settings_state.save_now(&locations)?;
+        let reload = locations.voice_roots != self.resources.voice_roots
+            || locations.dictionary != self.resources.dictionary;
         self.resources = locations;
-        self.settings_state.loaded(&self.resources);
-        self.reload_voices()
+        if reload {
+            self.reload_voices()?;
+        }
+        Ok(())
     }
 }

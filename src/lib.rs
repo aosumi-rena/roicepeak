@@ -20,6 +20,7 @@ pub mod prosody;
 pub mod sampling;
 pub mod scalar_layers;
 pub mod sequence;
+pub mod speech_frontend;
 pub mod stylebook;
 pub mod synthesis;
 pub mod tensor;

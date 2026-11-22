@@ -1,19 +1,27 @@
 use super::{
-    JobKind, Playback, RenderProfile, Request, Shared, cache::Cache, checkpoint, engine, unit,
+    JobKind, Playback, RenderProfile, Request, Shared, cache::Cache, checkpoint, engine,
+    streaming::PcmRange, unit,
 };
-use roicepeak::{Error, Result, scalar_layers::ScalarLayers};
+use roicepeak::{Error, Result, scalar_layers::ScalarLayers, speech_frontend::Language};
 use std::{sync::Arc, time::Instant};
 
-pub(super) fn render(
+fn check(session: &Playback, shared: &Shared) -> Result<()> {
+    if session.cancelled() || session.failure().is_some() {
+        return Err(Error("Synthesis cancelled".into()));
+    }
+    checkpoint(shared, session.generation, JobKind::Playback)
+}
+
+pub(super) fn prepare(
     request: &Request,
     session: &Playback,
     unit_index: usize,
     cache: &mut Cache,
     shared: &Shared,
     profile: &mut RenderProfile,
-) -> Result<Arc<Vec<f32>>> {
-    let generation = session.generation;
-    checkpoint(shared, generation, JobKind::Playback)?;
+) -> Result<unit::Prepared> {
+    let check = || check(session, shared);
+    check()?;
     let planned = &session.plan.units[unit_index];
     let block = request
         .project
@@ -26,22 +34,10 @@ pub(super) fn render(
             "Playback dictionary disagrees with its preparation".into(),
         ));
     }
-    let dictionary_started = Instant::now();
-    let words = engine::user_words(request.user_dictionary.entries())?;
-    cache.dictionary(&request.config.dictionary)?;
-    let dictionary = cache.dictionary.as_ref().unwrap();
-    let user = dictionary.tagger.user_dictionary(&words)?;
-    let mut stamps = dictionary.stamp.clone();
-    stamps.extend(
-        user.definition_files()
-            .iter()
-            .map(|source| super::cache::Stamp {
-                path: source.path.clone(),
-                len: source.bytes,
-                modified: source.modified,
-            }),
-    );
-    profile.dictionary_seconds += dictionary_started.elapsed().as_secs_f64();
+    let language = Language::from_name(&block.narrator.language)
+        .ok_or_else(|| Error(format!("Unsupported language {}", block.narrator.language)))?;
+    let (user, stamps) =
+        engine::dictionary(cache, request, language == Language::Japanese, profile)?;
     let binding = request.config.binding(&block.narrator).map_err(Error)?;
     let validation_started = Instant::now();
     let validated = cache.validate_voice(binding)?;
@@ -62,7 +58,9 @@ pub(super) fn render(
         project: engine::normalized(&request.project.global),
         narrator: engine::normalized(&corrections),
     };
-    layers.resolve_with_policy(request.config.value_policy)?;
+    let volume_gain = layers
+        .resolve_with_policy(request.config.value_policy)?
+        .volume_gain;
     let words = session
         .plan
         .blocks
@@ -71,8 +69,11 @@ pub(super) fn render(
         .and_then(|prepared| prepared.sentences.get(planned.sentence.index))
         .ok_or_else(|| Error("Playback sentence state is unavailable".into()))?;
     let mut spec = unit::Spec {
-        kind: JobKind::Render,
+        kind: JobKind::Playback,
+        generation: session.generation,
+        keep_prepared_queries: true,
         original: &block.text[planned.sentence.bytes.clone()],
+        language,
         sentence: &planned.sentence,
         saved_words: &words.words,
         ssml: words.ssml.as_ref(),
@@ -80,16 +81,16 @@ pub(super) fn render(
         project_parameters: &request.project.global,
         narrator_parameters: &corrections,
         layers,
+        volume_gain,
         value_policy: request.config.value_policy,
         weights: &[],
-        style_offset: 0.0,
         voice: Arc::clone(&validated.binding),
         dictionary: request.user_dictionary.shared(),
         dictionary_stamp: &stamps,
     };
-    checkpoint(shared, generation, JobKind::Playback)?;
-    let output = if let Some(output) = unit::cached(cache, &validated.stamp, &spec, profile)? {
-        output
+    check()?;
+    let prepared = if let Some(output) = unit::cached(cache, &validated.stamp, &spec, profile)? {
+        unit::Prepared::Ready(output)
     } else {
         let voice_started = Instant::now();
         profile.voice_requests += 1;
@@ -98,6 +99,7 @@ pub(super) fn render(
         let lease = lease_result?;
         profile.voice_lease(&lease);
         let voice = lease.voice;
+        session.set_seek_preroll(unit_index, voice.manifest.synth.seek_preroll_samples());
         let weights = engine::weights(
             &voice,
             binding,
@@ -106,24 +108,40 @@ pub(super) fn render(
             request.config.value_policy,
         )?;
         spec.weights = &weights;
-        spec.style_offset = voice.manifest.synth.stylebook().mix(&weights)?.intonation;
-        let mut emit = |samples: &[f32]| {
-            checkpoint(shared, generation, JobKind::Playback)?;
-            session.append(unit_index, samples).map_err(Error)
-        };
-        unit::perform(
-            cache,
-            &voice,
-            &user,
-            spec,
-            profile,
-            || checkpoint(shared, generation, JobKind::Playback),
-            Some(&mut emit),
-        )?
+        unit::prepare(cache, &voice, user.as_ref(), spec, profile, check)?
     };
-    checkpoint(shared, generation, JobKind::Playback)?;
+    check()?;
     profile.cache_state(cache);
-    output
-        .pcm
-        .ok_or_else(|| Error("Playback unit did not produce PCM".into()))
+    Ok(prepared)
+}
+
+pub(super) fn render(
+    audio: unit::Audio,
+    session: &Playback,
+    index: usize,
+    shared: &Shared,
+    profile: &mut RenderProfile,
+) -> Result<unit::RenderedAudio> {
+    let check = || check(session, shared);
+    let mut emit = |start: usize, samples: &[f32]| {
+        check()?;
+        session.append(index, start, samples).map_err(Error)
+    };
+    audio.render(
+        profile,
+        check,
+        Some(unit::PlaybackTarget {
+            sample: session.seek_target(index),
+            emit: &mut emit,
+        }),
+    )
+}
+
+pub(super) fn pcm(output: unit::Output) -> Result<PcmRange> {
+    Ok(PcmRange {
+        start: output.pcm_start,
+        samples: output
+            .pcm
+            .ok_or_else(|| Error("Playback unit did not produce PCM".into()))?,
+    })
 }

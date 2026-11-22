@@ -1,4 +1,6 @@
+use crate::app::script_playback::WordKey;
 use eframe::egui::{self, Color32, Rect, Sense, Ui, UiBuilder, Vec2};
+use std::ops::Range;
 
 const THICKNESS: f32 = 16.0;
 
@@ -11,7 +13,8 @@ enum Held {
 #[derive(Clone)]
 struct State {
     held: Option<Held>,
-    reset_pending: bool,
+    block: Option<u64>,
+    word: Option<WordKey>,
     last_frame: Option<u64>,
 }
 
@@ -19,7 +22,8 @@ impl Default for State {
     fn default() -> Self {
         Self {
             held: None,
-            reset_pending: true,
+            block: None,
+            word: None,
             last_frame: None,
         }
     }
@@ -59,6 +63,9 @@ impl State {
         ui: &mut Ui,
         viewport: Rect,
         width: f32,
+        block: u64,
+        follow: Option<(WordKey, Range<f32>)>,
+        playing: bool,
         add_contents: impl FnOnce(&mut Ui, Rect) -> R,
     ) -> R {
         let frame = ui.ctx().cumulative_frame_nr();
@@ -84,10 +91,11 @@ impl State {
         host.set_clip_rect(area.intersect(ui.clip_rect()));
         let salt = "phoneme-scroll";
         let scroll_id = host.make_persistent_id(egui::IdSalt::new(salt));
-        if self.reset_pending {
+        if self.block != Some(block) {
             egui::scroll_area::State::default().store(host.ctx(), scroll_id);
             self.held = None;
-            self.reset_pending = false;
+            self.block = Some(block);
+            self.word = None;
         }
         let extent = f64::from(width);
         let page = f64::from(viewport.width());
@@ -99,6 +107,19 @@ impl State {
                 .x,
         )
         .clamp(0.0, maximum);
+        let key = follow.as_ref().map(|(key, _)| *key);
+        if self.word != key
+            && self.held.is_none()
+            && page > 0.0
+            && let Some((_, range)) = &follow
+        {
+            let center = f64::from(range.start + (range.end - range.start) * 0.5);
+            if !(offset..offset + page).contains(&center) {
+                let pages = ((center - offset) / page).floor();
+                offset = (offset + pages * page).clamp(0.0, maximum);
+            }
+        }
+        self.word = key;
         crate::app::inspector_scroll::register_wheel_region(
             ui,
             scroll_id,
@@ -173,11 +194,30 @@ impl State {
                     (repeat_at - now).max(0.0),
                 ));
         }
+        let locked = playing && follow.is_some();
+        if locked
+            && !cfg!(target_os = "windows")
+            && ui.is_enabled()
+            && ui.rect_contains_pointer(area)
+            && ui.ctx().dragged_id().is_none()
+        {
+            let delta = ui.input(|input| input.smooth_scroll_delta());
+            offset -= f64::from(if ui.style().always_scroll_the_only_direction {
+                delta.x + delta.y
+            } else {
+                delta.x
+            });
+        }
+        if playing && let Some((_, word)) = &follow {
+            let left = f64::from(word.start);
+            let right = f64::from(word.end) - page;
+            offset = offset.clamp(right.min(left), left).clamp(0.0, maximum);
+        }
         let output = egui::ScrollArea::horizontal()
             .id_salt(salt)
             .horizontal_scroll_offset(offset as f32)
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-            .scroll_source(if cfg!(target_os = "windows") {
+            .scroll_source(if cfg!(target_os = "windows") || locked {
                 egui::scroll_area::ScrollSource::NONE
             } else {
                 egui::scroll_area::ScrollSource::MOUSE_WHEEL
@@ -223,13 +263,16 @@ pub(super) fn show<R>(
     ui: &mut Ui,
     viewport: Rect,
     width: f32,
+    block: u64,
+    follow: Option<(WordKey, Range<f32>)>,
+    playing: bool,
     add_contents: impl FnOnce(&mut Ui, Rect) -> R,
 ) -> R {
     let id = ui.id().with("phoneme-scroll-controls");
     let mut state = ui
         .data_mut(|data| data.get_temp::<State>(id))
         .unwrap_or_default();
-    let result = state.show(ui, viewport, width, add_contents);
+    let result = state.show(ui, viewport, width, block, follow, playing, add_contents);
     ui.data_mut(|data| data.insert_temp(id, state));
     result
 }

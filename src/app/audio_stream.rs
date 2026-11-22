@@ -1,3 +1,4 @@
+use super::resampling::Sinc;
 use super::*;
 use crate::app::render::{Playback, SAMPLE_RATE};
 use std::{sync::atomic::AtomicU8, thread::JoinHandle};
@@ -149,12 +150,9 @@ impl Live {
     pub(super) fn position(&self) -> f64 {
         (self.state.cursor.load(Ordering::Acquire) as u32) as f64 / f64::from(self.state.rate)
     }
-    pub(super) fn seek(&self, seconds: f64) {
-        let position = if seconds.is_finite() {
-            (seconds.max(0.0) * f64::from(self.state.rate)).min(f64::from(self.state.len)) as u32
-        } else {
-            0
-        };
+    pub(super) fn seek(&self, seconds: f64, round_up: bool) {
+        let position =
+            super::seek_sample(seconds, self.state.rate, self.state.len as usize, round_up) as u32;
         if let Some((_, start, end)) = self.state.snapshot() {
             self.state.configure(start, end, position);
         }
@@ -198,54 +196,26 @@ impl Live {
     }
 }
 
-fn device_window(state: &State, first: u32, count: usize) -> Result<Option<Vec<f32>>, String> {
+fn device_window(
+    state: &State,
+    resampler: &mut Sinc,
+    first: u32,
+    count: usize,
+) -> Result<Option<Vec<f32>>, String> {
     let total = state.source.plan.samples;
+    let first = first as usize;
     if state.rate == SAMPLE_RATE {
-        return state
-            .source
-            .mix_window(first as usize, (first as usize + count).min(total));
+        return state.source.mix_window(first, (first + count).min(total));
     }
-    let ratio = f64::from(SAMPLE_RATE) / f64::from(state.rate);
-    let left = ((f64::from(first) * ratio).floor() as i64 - 31).max(0) as usize;
-    let right =
-        (((f64::from(first) + count as f64 - 1.0) * ratio).floor() as i64 + 33).max(0) as usize;
-    let right = right.min(total);
-    let Some(input) = state.source.mix_window(left.min(total), right)? else {
+    let span = resampler.source_span(first, count, total);
+    let Some(input) = state.source.mix_window(span.start, span.end)? else {
         return Ok(None);
     };
-    let cutoff = (f64::from(state.rate) / f64::from(SAMPLE_RATE)).min(1.0) * 0.95;
-    let mut output = Vec::with_capacity(count);
-    for index in 0..count {
-        let at = (f64::from(first) + index as f64) * ratio;
-        let center = at.floor() as i64;
-        let mut sum = 0.0;
-        let mut weight = 0.0;
-        for j in center - 31..=center + 32 {
-            let delta = at - j as f64;
-            let window = 0.42
-                + 0.5 * (std::f64::consts::PI * delta / 32.0).cos()
-                + 0.08 * (std::f64::consts::TAU * delta / 32.0).cos();
-            let z = std::f64::consts::PI * cutoff * delta;
-            let w = if z.abs() < 1e-12 {
-                cutoff
-            } else {
-                cutoff * z.sin() / z
-            } * window;
-            if j >= 0 && (j as usize) < total {
-                sum += f64::from(input[j as usize - left]) * w;
-                weight += w;
-            }
-        }
-        output.push(if weight.abs() > 1e-12 {
-            (sum / weight) as f32
-        } else {
-            0.0
-        });
-    }
-    Ok(Some(output))
+    Ok(Some(resampler.window(&input, span.start, first, count)))
 }
 
 fn feed(state: Arc<State>) {
+    let mut resampler = Sinc::new(SAMPLE_RATE, state.rate);
     let mut epoch = 0;
     let mut next = 0u32;
     while !state.stopped.load(Ordering::Acquire) && !state.source.cancelled() {
@@ -272,7 +242,7 @@ fn feed(state: Arc<State>) {
             state.source.wait();
             continue;
         }
-        let values = match device_window(&state, next, count) {
+        let values = match device_window(&state, &mut resampler, next, count) {
             Ok(Some(values)) => values,
             Ok(None) => {
                 state.source.wait();

@@ -1,9 +1,16 @@
 //! Character CNN and word transformer for explicitly supplied language models.
 #[path = "language_characters.rs"]
 pub(crate) mod characters;
+#[path = "language_memo.rs"]
+mod memo;
 #[path = "language_position.rs"]
 mod position;
-use std::{collections::HashMap, sync::OnceLock};
+#[path = "language_cache.rs"]
+mod shared;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use crate::{
     Result,
@@ -13,12 +20,18 @@ use crate::{
         generated_activation::{GeneratedActivation, Kind},
     },
     invalid,
+    speech_frontend::Language,
     tensor::{Tensor, u32_at},
 };
 
 #[derive(Debug)]
 pub struct CharacterEncoder {
     pub cache_id: [u8; 8],
+    network: Arc<CharacterNetwork>,
+}
+
+#[derive(Debug)]
+struct CharacterNetwork {
     alphabet: HashMap<char, usize>,
     table: Tensor,
     convolutions: Vec<Graph>,
@@ -26,9 +39,13 @@ pub struct CharacterEncoder {
     transform: Graph,
     gate: Graph,
     projection: Graph,
+    words: Option<memo::Words>,
 }
-impl CharacterEncoder {
-    pub fn estimated_bytes(&self) -> usize {
+static CHARACTERS: shared::Shared<CharacterNetwork> = Mutex::new(BTreeMap::new());
+static CONTEXT: shared::Shared<Vec<Graph>> = Mutex::new(BTreeMap::new());
+
+impl CharacterNetwork {
+    fn estimated_bytes(&self) -> usize {
         use crate::memory as m;
         m::sum([
             m::hash(&self.alphabet, |_| 0, |_| 0),
@@ -37,13 +54,11 @@ impl CharacterEncoder {
             self.transform.estimated_bytes(),
             self.gate.estimated_bytes(),
             self.projection.estimated_bytes(),
+            self.words.as_ref().map_or(0, memo::Words::estimated_bytes),
         ])
     }
 
-    pub fn compile(n: &Node<'_>) -> Result<Self> {
-        if n.tag != "_lmce0" || n.children.len() != 4 || n.payload.len() < 16 {
-            return Err(invalid("character encoder structure"));
-        }
+    fn compile(n: &Node<'_>) -> Result<Self> {
         let count = u32_at(n.payload, 8)? as usize;
         let output_width = u32_at(n.payload, 12)? as usize;
         if !(1..=65535).contains(&count)
@@ -72,8 +87,11 @@ impl CharacterEncoder {
         if table.cols() != count + 4 {
             return Err(invalid("character embedding alphabet dimension"));
         }
+        let transform = Graph::compile(&highway.children[0])?;
+        let gate = Graph::compile(&highway.children[1])?;
+        let projection = Graph::compile(projection)?;
+        let words = memo::Words::for_graphs([&transform, &gate, &projection]);
         Ok(Self {
-            cache_id: n.payload[..8].try_into().unwrap(),
             alphabet,
             table,
             convolutions: convs
@@ -82,17 +100,42 @@ impl CharacterEncoder {
                 .map(Graph::compile)
                 .collect::<Result<_>>()?,
             tanh: GeneratedActivation::new(Kind::Tanh)?,
-            transform: Graph::compile(&highway.children[0])?,
-            gate: Graph::compile(&highway.children[1])?,
-            projection: Graph::compile(projection)?,
+            transform,
+            gate,
+            projection,
+            words,
         })
     }
+}
+
+impl CharacterEncoder {
+    pub fn estimated_bytes(&self) -> usize {
+        crate::memory::arc::<CharacterNetwork>(self.network.estimated_bytes())
+    }
+
+    pub fn compile(n: &Node<'_>) -> Result<Self> {
+        if n.tag != "_lmce0" || n.children.len() != 4 || n.payload.len() < 16 {
+            return Err(invalid("character encoder structure"));
+        }
+        let (cache_id, payload) = n.payload.split_at(8);
+        Ok(Self {
+            cache_id: cache_id.try_into().unwrap(),
+            network: shared::compile(&CHARACTERS, n, payload, || CharacterNetwork::compile(n))?,
+        })
+    }
+
     pub fn ids(&self, word: &str) -> Vec<usize> {
-        characters::ordinary(word, &self.alphabet)
+        characters::ordinary(word, &self.network.alphabet)
     }
     pub fn encode(&self, words: &[String], budget: &mut Budget) -> Result<Tensor> {
         let ids: Vec<_> = words.iter().map(|w| self.ids(w)).collect();
-        self.encode_ids(&ids, budget)
+        if let Some(cache) = &self.network.words
+            && (1..=4096).contains(&ids.len())
+        {
+            cache.encode(ids, budget, |input, budget| self.encode_ids(input, budget))
+        } else {
+            self.encode_ids(&ids, budget)
+        }
     }
     /// Special boundary tokens can supply BOW/EOW directly, followed by padding.
     pub fn encode_ids(&self, words: &[Vec<usize>], budget: &mut Budget) -> Result<Tensor> {
@@ -101,10 +144,11 @@ impl CharacterEncoder {
         }
         let mut maxima = Vec::new();
         let mut width = None;
+        let network = &self.network;
         for ids in words {
-            let embedded = characters::embed(ids, &self.table, budget)?;
+            let embedded = characters::embed(ids, &network.table, budget)?;
             let start = maxima.len();
-            for conv in &self.convolutions {
+            for conv in &network.convolutions {
                 let y = conv.run_with(&embedded, budget)?;
                 if y.rows() == 0 {
                     return Err(invalid("empty character convolution"));
@@ -122,11 +166,11 @@ impl CharacterEncoder {
                 return Err(invalid("word embedding widths differ"));
             }
             budget.spend(cols.saturating_mul(32), 0)?;
-            self.tanh.apply_in_place(&mut maxima[start..])?;
+            network.tanh.apply_in_place(&mut maxima[start..])?;
         }
         let h = Tensor::new(words.len(), width.unwrap(), maxima)?;
-        let g = self.gate.run_with(&h, budget)?;
-        let transformed = self.transform.run_with(&h, budget)?;
+        let g = network.gate.run_with(&h, budget)?;
+        let transformed = network.transform.run_with(&h, budget)?;
         if g.rows() != h.rows()
             || g.cols() != h.cols()
             || transformed.rows() != h.rows()
@@ -145,7 +189,7 @@ impl CharacterEncoder {
                 .map(|((&h, &g), &t)| g * t + (1.0 - g) * h)
                 .collect(),
         )?;
-        self.projection.run_with(&mixed, budget)
+        network.projection.run_with(&mixed, budget)
     }
 }
 
@@ -203,11 +247,11 @@ impl CharacterCache {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LanguageModel {
-    encoder: CharacterEncoder,
-    layers: Vec<Graph>,
-    cache: Option<CharacterCache>,
+    encoder: Arc<CharacterEncoder>,
+    layers: Arc<Vec<Graph>>,
+    cache: Option<Arc<CharacterCache>>,
     boundaries: OnceLock<Tensor>,
 }
 impl LanguageModel {
@@ -216,12 +260,36 @@ impl LanguageModel {
     }
 
     pub fn estimated_bytes(&self) -> usize {
+        crate::memory::sum(
+            std::iter::once(self.local_bytes())
+                .chain(self.shared_allocations().map(|(_, bytes)| bytes)),
+        )
+    }
+
+    pub(crate) fn local_bytes(&self) -> usize {
         crate::memory::sum([
-            self.encoder.estimated_bytes(),
-            crate::memory::nested(&self.layers, Graph::estimated_bytes),
-            crate::memory::optional(&self.cache, CharacterCache::estimated_bytes),
+            crate::memory::arc::<CharacterEncoder>(0),
+            crate::memory::optional(&self.cache, |cache| {
+                crate::memory::arc::<CharacterCache>(cache.estimated_bytes())
+            }),
             self.boundaries.get().map_or(0, Tensor::estimated_bytes),
         ])
+    }
+
+    pub(crate) fn shared_allocations(&self) -> [(usize, usize); 2] {
+        [
+            (
+                Arc::as_ptr(&self.encoder.network).addr(),
+                self.encoder.estimated_bytes(),
+            ),
+            (
+                Arc::as_ptr(&self.layers).addr(),
+                crate::memory::arc::<Vec<Graph>>(crate::memory::nested(
+                    &self.layers,
+                    Graph::estimated_bytes,
+                )),
+            ),
+        ]
     }
 
     pub fn compile(root: &Node<'_>) -> Result<Self> {
@@ -232,13 +300,12 @@ impl LanguageModel {
         if bert.tag != "_lmbrt0" || bert.children.len() != 1 {
             return Err(invalid("language transformer structure"));
         }
+        let layers = &bert.children[0];
         Ok(Self {
-            encoder: CharacterEncoder::compile(&root.children[0])?,
-            layers: bert.children[0]
-                .children
-                .iter()
-                .map(Graph::compile)
-                .collect::<Result<_>>()?,
+            encoder: Arc::new(CharacterEncoder::compile(&root.children[0])?),
+            layers: shared::compile(&CONTEXT, layers, layers.payload, || {
+                layers.children.iter().map(Graph::compile).collect()
+            })?,
             cache: None,
             boundaries: OnceLock::new(),
         })
@@ -247,7 +314,7 @@ impl LanguageModel {
         if cache.identity != self.encoder.cache_id {
             return Err(invalid("character cache does not belong to language model"));
         }
-        self.cache = Some(cache);
+        self.cache = Some(Arc::new(cache));
         self.boundaries.take();
         Ok(())
     }
@@ -311,7 +378,7 @@ impl LanguageModel {
     }
     pub fn contextualize(&self, embeddings: &Tensor, budget: &mut Budget) -> Result<Tensor> {
         let mut x = position::apply(embeddings, budget)?;
-        for layer in &self.layers {
+        for layer in self.layers.iter() {
             x = layer.run_with(&x, budget)?;
         }
         Ok(x)
@@ -330,7 +397,10 @@ impl LanguageModel {
         let words: Vec<_> = tokens
             .iter()
             .filter(|t| t.pos != 0x2000 && t.pos != 0x2001)
-            .map(|t| t.text.clone())
+            .map(|t| {
+                Language::from_token_id(t.language)
+                    .map_or_else(|| t.text.clone(), |language| language.model_word(&t.text))
+            })
             .collect();
         let words = if words.is_empty() {
             None

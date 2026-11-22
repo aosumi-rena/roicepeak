@@ -44,13 +44,7 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
     let input: Input = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     let locations = Locations::read(&input.locations)?;
     let catalog = Catalog::load_roots(&locations.voice_roots)?;
-    let mut config = Config::from_catalog(
-        locations
-            .dictionary
-            .clone()
-            .ok_or("Explicit locations require a dictionary path")?,
-        &catalog,
-    )?;
+    let mut config = Config::from_catalog(locations.dictionary.clone(), &catalog)?;
     config.value_policy = locations.value_policy();
     let mut project = project_files::read(&input.project, Some(&config))?;
     let source = project

@@ -5,26 +5,19 @@ const QUARTER_PI: f64 = std::f64::consts::FRAC_PI_4;
 const TINY: f64 = f64::from_bits(0x3e40_0000_0000_0000);
 const SMALL: f64 = f64::from_bits(0x3f20_0000_0000_0000);
 
-fn evaluate(value: f32, sine: bool, fused: bool) -> f32 {
+pub(super) fn sine_cosine(value: f32, fused: bool) -> (f32, f32) {
     debug_assert!(value.is_finite() && value.abs() <= 361_000.0);
     let x = f64::from(value);
     let absolute = x.abs();
-    let small = if fused && !sine {
-        absolute <= QUARTER_PI
-    } else {
-        absolute < QUARTER_PI
-    };
-    if small {
-        let output = if sine {
-            if (fused && absolute < TINY) || (!fused && absolute <= TINY) {
-                return value;
-            }
-            if fused && absolute < SMALL {
-                (-((x * x) * x)).mul_add(-polynomial::S[0], x)
-            } else {
-                polynomial::small_sine(x, fused)
-            }
-        } else if absolute < TINY {
+    if absolute <= QUARTER_PI {
+        let sine = if absolute < TINY || (!fused && absolute == TINY) {
+            value
+        } else if fused && absolute < SMALL {
+            (-((x * x) * x)).mul_add(-polynomial::S[0], x) as f32
+        } else {
+            polynomial::small_sine(x, fused) as f32
+        };
+        let cosine = if absolute < TINY {
             1.0
         } else if absolute < SMALL {
             if fused {
@@ -35,34 +28,31 @@ fn evaluate(value: f32, sine: bool, fused: bool) -> f32 {
         } else {
             polynomial::small_cosine(x, fused)
         };
-        return output as f32;
+        return (sine, cosine as f32);
     }
     let (r, tail, quadrant) = if fused {
         reduction::fused(absolute)
     } else {
         reduction::scalar(absolute)
     };
-    let want_sine = (quadrant & 1 != 0) != sine;
-    let output = if want_sine {
-        polynomial::reduced_sine(r, tail, fused)
+    let sine = polynomial::reduced_sine(r, tail, fused);
+    let cosine = polynomial::reduced_cosine(r, tail, fused);
+    let (sine, cosine) = if quadrant & 1 == 0 {
+        (sine, cosine)
     } else {
-        polynomial::reduced_cosine(r, tail, fused)
+        (cosine, sine)
     };
-    let negative = if sine {
-        value.is_sign_negative() != (quadrant & 2 != 0)
-    } else {
-        (quadrant + 1) & 2 != 0
+    let signed = |value: f64, negative: bool| {
+        if !negative {
+            value as f32
+        } else if fused {
+            f64::from_bits(value.to_bits() ^ (1 << 63)) as f32
+        } else {
+            (0.0 - value) as f32
+        }
     };
-    let output = if !negative {
-        output
-    } else if fused {
-        f64::from_bits(output.to_bits() ^ (1 << 63))
-    } else {
-        0.0 - output
-    };
-    output as f32
-}
-
-pub(super) fn sine_cosine(value: f32, fused: bool) -> (f32, f32) {
-    (evaluate(value, true, fused), evaluate(value, false, fused))
+    (
+        signed(sine, value.is_sign_negative() != (quadrant & 2 != 0)),
+        signed(cosine, (quadrant + 1) & 2 != 0),
+    )
 }

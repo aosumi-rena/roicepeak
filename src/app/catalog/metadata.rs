@@ -6,6 +6,7 @@ use crate::app::render::{EmotionBinding, VoiceBinding};
 use roicepeak::{
     dnni,
     manifest::{CharacterCacheResources, ModelResources},
+    speech_frontend::Language,
     stylebook::{Offsets, Stylebook},
 };
 use serde::Deserialize;
@@ -124,6 +125,7 @@ pub(super) fn load(
     source: &Path,
     bytes: Arc<Vec<u8>>,
     resolved: Resolved,
+    inspect_portraits: bool,
 ) -> Result<Voice, String> {
     let canonical_root = fs::canonicalize(root).map_err(|e| e.to_string())?;
     if !source.starts_with(&canonical_root) {
@@ -145,14 +147,13 @@ pub(super) fn load(
         return Err("Voice entrance item count limit".into());
     }
     let entrance = &description.entrance;
-    let mut narrator: Narrator =
+    let narrator: Narrator =
         serde_json::from_slice(&required(entrance, "pub/rc/idc.json", 65_536)?)
             .map_err(|e| format!("Narrator metadata: {e}"))?;
-    if resolved.derived
-        && let Some(languages) = &description.languages
-    {
-        narrator.supported_language_list = languages.clone();
-    }
+    let languages = description
+        .languages
+        .as_ref()
+        .unwrap_or(&narrator.supported_language_list);
     for value in [
         &narrator.inst_id,
         &narrator.narrator_id,
@@ -164,12 +165,18 @@ pub(super) fn load(
     if narrator.inst_id != description.pack_names.entrance {
         return Err("Narrator entrance identity differs from its pack declaration".into());
     }
-    if narrator.supported_language_list.is_empty() || narrator.supported_language_list.len() > 16 {
+    if languages.is_empty() || languages.len() > 16 {
         return Err("Narrator language count limit".into());
     }
-    for language in &narrator.supported_language_list {
+    for language in languages {
         text(language)?;
     }
+    let default_language = narrator
+        .supported_language_list
+        .iter()
+        .filter(|language| languages.contains(language))
+        .chain(languages)
+        .find_map(|language| Language::from_name(language));
     if narrator.key_color.len() != 6 || !narrator.key_color.bytes().all(|c| c.is_ascii_hexdigit()) {
         return Err("Narrator key color must contain six hexadecimal digits".into());
     }
@@ -273,9 +280,6 @@ pub(super) fn load(
             }
         }
     }
-    let portrait_bytes = portrait_declarations
-        .get(&narrator.main_emotion_engine_key)
-        .and_then(|key| artwork(&entrance_root, entrance, key, 16 * 1024 * 1024));
     let mut emotion_bindings = Vec::new();
     let mut emotions = Vec::new();
     for emotion in narrator.emotion_list {
@@ -394,18 +398,6 @@ pub(super) fn load(
     for problem in entrance_root.take_problems() {
         root.problem(problem);
     }
-    let portrait_main = match portrait_bytes
-        .map(|bytes| super::artwork::portrait(bytes, narrator.standing_pic_default_region))
-        .transpose()
-    {
-        Ok(portrait) => portrait,
-        Err(error) => {
-            root.problem(format!(
-                "Declared standing artwork cannot be decoded: {error}"
-            ));
-            None
-        }
-    };
     let source_bytes = bytes;
     let portrait_sources = super::PortraitSources::new(
         &entrance_root,
@@ -417,6 +409,17 @@ pub(super) fn load(
         portrait_declarations,
         narrator.standing_pic_default_region,
     );
+    let portrait_main = if inspect_portraits {
+        match portrait_sources.load(&narrator.main_emotion_engine_key) {
+            Ok(portrait) => portrait,
+            Err(error) => {
+                root.problem(format!("Optional standing artwork: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
     Ok(Voice {
         key: if resolved.derived {
             description.name.clone()
@@ -431,7 +434,8 @@ pub(super) fn load(
         collection_name: description.name,
         version: narrator.version,
         vendor: narrator.vendor,
-        languages: narrator.supported_language_list,
+        languages: languages.clone(),
+        default_language,
         emotions,
         can_commercial: narrator.can_commercial,
         color,

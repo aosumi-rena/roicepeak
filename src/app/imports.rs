@@ -202,13 +202,13 @@ impl crate::app::editor::EditorApp {
             .catalog
             .voice(&default_key)
             .map(|voice| voice.name.clone());
-        let batch = match format {
+        let mut batch = match format {
             Format::Csv => {
                 let names = self
                     .catalog
                     .voices
                     .iter()
-                    .map(|voice| voice.name.clone())
+                    .flat_map(|voice| [voice.name.clone(), voice.collection_name.clone()])
                     .collect::<BTreeSet<_>>();
                 parse_csv(
                     &text,
@@ -220,6 +220,24 @@ impl crate::app::editor::EditorApp {
                 )?
             }
         };
+        let mut narrator_keys: BTreeMap<_, _> = self
+            .catalog
+            .voices
+            .iter()
+            .map(|voice| (voice.name.as_str(), voice.collection_name.as_str()))
+            .collect();
+        for voice in &self.catalog.voices {
+            narrator_keys.insert(&voice.collection_name, &voice.collection_name);
+        }
+        for block in &mut batch.blocks {
+            if let Some(key) = block
+                .narrator
+                .as_deref()
+                .and_then(|name| narrator_keys.get(name))
+            {
+                block.narrator = Some((*key).to_owned());
+            }
+        }
         let first = self.project.blocks.len();
         let (project, warnings) = append(
             &self.project,

@@ -1,8 +1,9 @@
 //! One persistent worker; render requests take priority over coalesced query preparation.
+use super::playback_work::Work as PlaybackWork;
 use super::*;
 use super::{
     cache::Cache,
-    engine::{Outcome, perform},
+    engine::{Outcome, perform, reusable_plan},
 };
 use std::sync::{MutexGuard, mpsc};
 
@@ -12,14 +13,26 @@ enum Publication<'a> {
     Prepare(MutexGuard<'a, Option<(u64, Result<PreparedProject, String>)>>),
     Playback(MutexGuard<'a, Option<(u64, Result<Arc<Playback>, String>)>>),
 }
-struct PlaybackWork {
-    request: Request,
-    session: Arc<Playback>,
-    profile: RenderProfile,
-    started: Instant,
-    submitted: Instant,
+fn playback_session(
+    plan: Arc<PreparedProject>,
+    generation: u64,
+    wake: SyncSender<()>,
+    block: Option<u64>,
+    start: f64,
+) -> Result<Outcome, String> {
+    let start = match block {
+        Some(id) => {
+            plan.blocks
+                .iter()
+                .find(|block| block.id == id && block.duration > 0.0)
+                .ok_or("The selected block has no prepared audio")?
+                .start
+        }
+        None => start,
+    };
+    Playback::new(plan, generation, wake, start).map(Outcome::Playback)
 }
-fn merge_operators(
+pub(super) fn merge_operators(
     profile: &mut RenderProfile,
     values: Vec<roicepeak::graph::profiling::OperatorTiming>,
 ) {
@@ -60,7 +73,19 @@ fn merge_operators(
 }
 impl Default for Worker {
     fn default() -> Self {
+        Self::new(false)
+    }
+}
+impl Worker {
+    pub(crate) fn for_editor() -> Self {
+        Self::new(true)
+    }
+
+    fn new(background_diagnostics: bool) -> Self {
         let shared = Arc::new(Shared::default());
+        if background_diagnostics {
+            super::profiling::Ledger::background(&shared);
+        }
         let worker_shared = shared.clone();
         let (wake, receiver) = mpsc::sync_channel(1);
         let playback_wake = wake.clone();
@@ -74,106 +99,19 @@ impl Default for Worker {
                         break;
                     }
                     loop {
-                        let job = worker_shared.pending.lock().ok().and_then(|mut p| p.take());
+                        let job = worker_shared
+                            .pending
+                            .lock()
+                            .ok()
+                            .and_then(|mut p| p.take_for_work());
                         let Some(job) = job else {
                             if let Some(work) = active.as_mut() {
-                                if checkpoint(
-                                    &worker_shared,
-                                    work.session.generation,
-                                    JobKind::Playback,
-                                )
-                                .is_err()
-                                {
-                                    work.session.cancel();
-                                    work.profile.finished(
-                                        "cancelled_or_superseded",
-                                        work.started.elapsed(),
-                                        work.submitted.elapsed(),
-                                    );
-                                    if let Ok(mut ledger) = worker_shared.diagnostics.lock() {
-                                        ledger.record(&work.profile);
-                                    }
+                                let progressed =
+                                    work.step(&mut cache, &worker_shared, &playback_wake);
+                                if work.session.finished() {
                                     active = None;
-                                    continue;
                                 }
-                                if let Some(index) = work.session.next() {
-                                    let result = std::panic::catch_unwind(
-                                        std::panic::AssertUnwindSafe(|| {
-                                            let (result, operators) =
-                                                roicepeak::graph::profiling::capture(|| {
-                                                    super::playback_unit::render(
-                                                        &work.request,
-                                                        &work.session,
-                                                        index,
-                                                        &mut cache,
-                                                        &worker_shared,
-                                                        &mut work.profile,
-                                                    )
-                                                });
-                                            merge_operators(&mut work.profile, operators);
-                                            result
-                                        }),
-                                    )
-                                    .unwrap_or_else(|_| {
-                                        cache = Cache::default();
-                                        work.profile.panicked = true;
-                                        Err(Error("Playback synthesis worker failed".into()))
-                                    });
-                                    if checkpoint(
-                                        &worker_shared,
-                                        work.session.generation,
-                                        JobKind::Playback,
-                                    )
-                                    .is_err()
-                                    {
-                                        work.session.cancel();
-                                    } else {
-                                        match result {
-                                            Ok(pcm) => {
-                                                if let Err(error) =
-                                                    work.session.complete(index, pcm)
-                                                {
-                                                    work.session.fail(error);
-                                                }
-                                            }
-                                            Err(error) => work.session.fail(error.to_string()),
-                                        }
-                                    }
-                                    let finished = work.session.finished();
-                                    let status = if work.session.cancelled() {
-                                        "cancelled_or_superseded"
-                                    } else if work.session.failure().is_some() {
-                                        "failed"
-                                    } else if finished {
-                                        "succeeded"
-                                    } else {
-                                        "rendering_sentences"
-                                    };
-                                    work.profile.finished(
-                                        status,
-                                        work.started.elapsed(),
-                                        work.submitted.elapsed(),
-                                    );
-                                    if finished {
-                                        if work.session.failure().is_none()
-                                            && !work.session.cancelled()
-                                        {
-                                            work.profile.output_samples = work.session.plan.samples;
-                                        }
-                                        work.profile.sample_rate = SAMPLE_RATE;
-                                        let _ = worker_shared.playback_busy.compare_exchange(
-                                            work.session.generation,
-                                            0,
-                                            Ordering::AcqRel,
-                                            Ordering::Acquire,
-                                        );
-                                    }
-                                    if let Ok(mut ledger) = worker_shared.diagnostics.lock() {
-                                        ledger.record(&work.profile);
-                                    }
-                                    if finished {
-                                        active = None;
-                                    }
+                                if progressed {
                                     continue;
                                 }
                             }
@@ -181,11 +119,8 @@ impl Default for Worker {
                         };
                         let generation = job.generation;
                         let kind = job.kind;
-                        let playback_request = (kind == JobKind::Playback).then(|| Request {
-                            config: job.request.config.clone(),
-                            project: job.request.project.clone(),
-                            user_dictionary: job.request.user_dictionary.clone(),
-                        });
+                        let playback_request =
+                            (kind == JobKind::Playback).then(|| Arc::clone(&job.request));
                         let started = Instant::now();
                         let mut profile = job.profile;
                         let mut progress = job.progress;
@@ -195,6 +130,29 @@ impl Default for Worker {
                         }
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let (result, operators) = roicepeak::graph::profiling::capture(|| {
+                                if kind != JobKind::Prepare {
+                                    cache.reserve_audio(&job.request, generation);
+                                }
+                                if let Some(plan) = job.prepared_playback
+                                    && reusable_plan(
+                                        &plan,
+                                        &job.request,
+                                        &mut cache,
+                                        &worker_shared,
+                                        generation,
+                                        &mut profile,
+                                    )?
+                                {
+                                    profile.playback_plan_reused = true;
+                                    return playback_session(
+                                        plan,
+                                        generation,
+                                        playback_wake.clone(),
+                                        job.playback_block,
+                                        job.playback_start,
+                                    )
+                                    .map_err(Error);
+                                }
                                 perform(
                                     job.request,
                                     &mut cache,
@@ -205,7 +163,7 @@ impl Default for Worker {
                                     progress.as_mut(),
                                 )
                             });
-                            profile.operators = operators.into_iter().map(Into::into).collect();
+                            merge_operators(&mut profile, operators);
                             result
                         }))
                         .unwrap_or_else(|_| {
@@ -218,24 +176,27 @@ impl Default for Worker {
                         .map_err(|e| e.to_string());
                         let result = if kind == JobKind::Playback {
                             result.and_then(|outcome| match outcome {
-                                Outcome::Prepare(plan) => {
-                                    if job.playback_block.is_some_and(|id| {
-                                        !plan
-                                            .blocks
-                                            .iter()
-                                            .any(|block| block.id == id && block.duration > 0.0)
-                                    }) {
-                                        Err("The selected block has no prepared audio".into())
-                                    } else {
-                                        Playback::new(plan, generation, playback_wake.clone())
-                                            .map(Outcome::Playback)
-                                    }
-                                }
+                                Outcome::Prepare(plan) => playback_session(
+                                    Arc::new(plan),
+                                    generation,
+                                    playback_wake.clone(),
+                                    job.playback_block,
+                                    job.playback_start,
+                                ),
+                                Outcome::Playback(_) => Ok(outcome),
                                 _ => Err("Unexpected playback plan result".into()),
                             })
                         } else {
                             result
                         };
+                        let mut handoff = if kind == JobKind::Prepare {
+                            worker_shared.pending.lock().ok()
+                        } else {
+                            None
+                        };
+                        if let Some(pending) = handoff.as_mut() {
+                            pending.active_preparation = None;
+                        }
                         // Acquire result locks before diagnostics and final timing.
                         let mut publication = match kind {
                             JobKind::Render => {
@@ -298,16 +259,20 @@ impl Default for Worker {
                                     ));
                                 }
                                 Some(Publication::Prepare(destination)) => {
-                                    **destination = Some((
-                                        generation,
-                                        result.and_then(|outcome| match outcome {
-                                            Outcome::Prepare(prepared) => Ok(prepared),
-                                            _ => {
-                                                Err("Unexpected render result for preparation"
-                                                    .into())
-                                            }
-                                        }),
-                                    ));
+                                    let result = result.and_then(|outcome| match outcome {
+                                        Outcome::Prepare(prepared) => Ok(prepared),
+                                        _ => Err("Unexpected render result for preparation".into()),
+                                    });
+                                    let waiting = handoff
+                                        .as_mut()
+                                        .and_then(|pending| pending.playback.as_mut())
+                                        .filter(|job| job.awaiting_preparation == Some(generation));
+                                    match (waiting, result) {
+                                        (Some(job), Ok(prepared)) => {
+                                            job.prepared_playback = Some(Arc::new(prepared));
+                                        }
+                                        (_, result) => **destination = Some((generation, result)),
+                                    }
                                 }
                                 Some(Publication::Playback(destination)) => {
                                     **destination = Some((
@@ -322,29 +287,14 @@ impl Default for Worker {
                                                 {
                                                     *live = Some(Arc::downgrade(&session));
                                                 }
-                                                let start = job
-                                                    .playback_block
-                                                    .and_then(|id| {
-                                                        session
-                                                            .plan
-                                                            .blocks
-                                                            .iter()
-                                                            .find(|block| block.id == id)
-                                                    })
-                                                    .map_or(job.playback_start, |block| {
-                                                        block.start
-                                                    });
-                                                session.prefetch(
-                                                    (start.max(0.0) * f64::from(SAMPLE_RATE))
-                                                        as usize,
-                                                );
-                                                active = Some(PlaybackWork {
-                                                    request: playback_request.unwrap(),
-                                                    session: Arc::clone(&session),
-                                                    profile: profile.clone(),
+                                                session.prime();
+                                                active = Some(PlaybackWork::new(
+                                                    playback_request.unwrap(),
+                                                    Arc::clone(&session),
+                                                    profile.clone(),
                                                     started,
-                                                    submitted: job.submitted,
-                                                });
+                                                    job.submitted,
+                                                ));
                                                 Ok(session)
                                             }
                                             _ => Err("Unexpected playback source result".into()),
@@ -356,6 +306,7 @@ impl Default for Worker {
                         }
                         drop(ledger);
                         drop(publication);
+                        drop(handoff);
                         if kind != JobKind::Playback
                             || active
                                 .as_ref()
@@ -381,32 +332,56 @@ impl Default for Worker {
             start_error: start.err().map(|e| e.to_string()),
         }
     }
-}
-impl Worker {
+
     pub fn busy(&self) -> bool {
         self.shared.busy.load(Ordering::Acquire) != 0
     }
     pub fn preparing(&self) -> bool {
         self.shared.preparing.load(Ordering::Acquire) != 0
     }
+    pub(crate) fn preparation_running(&self) -> bool {
+        self.shared
+            .pending
+            .lock()
+            .ok()
+            .and_then(|pending| {
+                pending
+                    .active_preparation
+                    .as_ref()
+                    .map(|(generation, _)| *generation)
+            })
+            .is_some_and(|generation| {
+                generation == self.shared.prepare_generation.load(Ordering::Acquire)
+            })
+    }
     pub fn submit(&mut self, request: Request) -> Result<(), String> {
-        self.enqueue(request, JobKind::Render, 0.0, None, None)
+        self.enqueue(request, JobKind::Render, 0.0, None, None, None)
             .map(|_| ())
     }
     /// Coalesce the latest full project snapshot. This job performs no acoustic/vocoder work.
     pub fn prepare(&mut self, request: Request) -> Result<(), String> {
-        self.enqueue(request, JobKind::Prepare, 0.0, None, None)
+        self.enqueue(request, JobKind::Prepare, 0.0, None, None, None)
             .map(|_| ())
     }
-    pub fn start_playback(&mut self, request: Request, start: f64) -> Result<(), String> {
+    pub fn start_playback(
+        &mut self,
+        request: Request,
+        start: f64,
+        prepared: Option<Arc<PreparedProject>>,
+    ) -> Result<(), String> {
         if !start.is_finite() || start < 0.0 {
             return Err("Invalid playback start".into());
         }
-        self.enqueue(request, JobKind::Playback, start, None, None)
+        self.enqueue(request, JobKind::Playback, start, None, prepared, None)
             .map(|_| ())
     }
-    pub fn start_block_playback(&mut self, request: Request, block: u64) -> Result<(), String> {
-        self.enqueue(request, JobKind::Playback, 0.0, Some(block), None)
+    pub fn start_block_playback(
+        &mut self,
+        request: Request,
+        block: u64,
+        prepared: Option<Arc<PreparedProject>>,
+    ) -> Result<(), String> {
+        self.enqueue(request, JobKind::Playback, 0.0, Some(block), prepared, None)
             .map(|_| ())
     }
     pub fn submit_with_progress(&mut self, plan: ProgressPlan) -> Result<RenderProgress, String> {
@@ -414,7 +389,7 @@ impl Worker {
         let prefix = Arc::clone(&pending.prefix);
         let valid = Arc::clone(&pending.valid);
         let total = pending.total;
-        let generation = self.enqueue(request, JobKind::Render, 0.0, None, Some(pending))?;
+        let generation = self.enqueue(request, JobKind::Render, 0.0, None, None, Some(pending))?;
         Ok(RenderProgress {
             generation,
             shared: Arc::downgrade(&self.shared),
@@ -429,6 +404,7 @@ impl Worker {
         kind: JobKind,
         playback_start: f64,
         playback_block: Option<u64>,
+        mut prepared_playback: Option<Arc<PreparedProject>>,
         progress: Option<super::progress::Pending>,
     ) -> Result<u64, String> {
         if let Some(error) = &self.start_error {
@@ -471,17 +447,39 @@ impl Worker {
             .map_err(|_| "Synthesis generation exhausted")?;
         let generation = previous + 1;
         profile.generation = generation;
+        let mut awaiting_preparation = None;
+        if kind == JobKind::Playback && prepared_playback.is_none() {
+            let preparing = self.shared.prepare_generation.load(Ordering::Acquire);
+            if prepare_result.as_ref().is_some_and(|(generation, result)| {
+                *generation == preparing
+                    && result.as_ref().is_ok_and(|plan| {
+                        plan.matches(&request.project, &request.config, &request.user_dictionary)
+                    })
+            }) {
+                prepared_playback = prepare_result
+                    .take()
+                    .and_then(|(_, result)| result.ok())
+                    .map(Arc::new);
+            } else if let Some((generation, active)) = &pending.active_preparation
+                && *generation == preparing
+                && active.same_inputs(&request)
+            {
+                awaiting_preparation = Some(preparing);
+            }
+        }
         kind.current(&self.shared)
             .store(generation, Ordering::Release);
         kind.busy(&self.shared).store(generation, Ordering::Release);
         let job = Job {
             generation,
             kind,
-            request,
+            request: Arc::new(request),
             submitted,
             profile: profile.clone(),
             playback_start,
             playback_block,
+            prepared_playback,
+            awaiting_preparation,
             progress: progress
                 .map(|pending| pending.bind(generation, Arc::downgrade(&self.shared))),
         };
@@ -502,8 +500,10 @@ impl Worker {
             JobKind::Playback => {
                 *playback_result = None;
                 *prepare_result = None;
-                self.shared.prepare_generation.store(0, Ordering::Release);
-                self.shared.preparing.store(0, Ordering::Release);
+                if awaiting_preparation.is_none() {
+                    self.shared.prepare_generation.store(0, Ordering::Release);
+                    self.shared.preparing.store(0, Ordering::Release);
+                }
                 replaced.extend(pending.prepare.take());
                 replaced.extend(pending.playback.replace(job));
                 if let Ok(live) = self.shared.playback_session.lock() {

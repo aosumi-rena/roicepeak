@@ -1,6 +1,7 @@
 use crate::app::{
     document::Block,
     editor::{EditorApp, Popup, script_layout},
+    script_playback,
     style::{self, Icon},
 };
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, TextEdit, Vec2};
@@ -73,17 +74,23 @@ impl EditorApp {
             self.scroll = (self.scroll - scroll).max(0.0);
         }
         let mut content_bottom = body.top() + 24.0;
+        self.script_metrics.prepare(
+            ui,
+            right - body.left() - 59.0,
+            self.font_points,
+            self.project.blocks.len(),
+        );
         let geometries: Vec<_> = self
             .project
             .blocks
             .iter()
-            .map(|block| {
-                let geometry = script_layout::Geometry::new(
+            .enumerate()
+            .map(|(index, block)| {
+                let geometry = self.script_metrics.geometry(
                     ui,
+                    index,
                     Pos2::new(body.left() + 59.0, content_bottom),
-                    right - body.left() - 59.0,
                     &block.text,
-                    self.font_points,
                 );
                 content_bottom += geometry.stride;
                 geometry
@@ -95,6 +102,48 @@ impl EditorApp {
             (content_bottom + 24.0 - surface.bottom()).max(0.0)
         };
         self.scroll = self.scroll.clamp(0.0, max_scroll);
+        if let Some(id) = self.playback_guide.reveal.take()
+            && let Some(index) = self.project.blocks.iter().position(|block| block.id == id)
+        {
+            let card = geometries[index]
+                .card
+                .translate(Vec2::new(0.0, -self.scroll));
+            let page = surface.height();
+            if page > 0.0 && (card.top() >= surface.bottom() || card.bottom() <= surface.top()) {
+                let pages = ((card.top() - surface.top()) / page).floor();
+                self.scroll = (self.scroll + pages * page).clamp(0.0, max_scroll);
+            }
+        }
+        if self.transport == crate::app::transport::Transport::Playing
+            && !self.playback_pending
+            && self.player.loaded()
+            && let Some(word) = &self.playback_guide.word
+            && let Some(chars) = &word.chars
+            && let Some(index) = self
+                .project
+                .blocks
+                .iter()
+                .position(|block| block.id == word.block)
+        {
+            let editor = geometries[index].editor;
+            let inset = script_layout::TEXT_MARGIN;
+            let galley = script_layout::layout(
+                ui,
+                &self.project.blocks[index].text,
+                editor.width() - f32::from(inset.left) - f32::from(inset.right),
+                self.font_points,
+                style::TEXT,
+            );
+            let origin = editor.min + Vec2::new(f32::from(inset.left), f32::from(inset.top));
+            if let Some(bounds) = script_playback::word_bounds(&galley, origin, chars.clone()) {
+                let minimum_scroll = bounds.bottom() - surface.bottom();
+                let maximum_scroll = bounds.top() - surface.top();
+                self.scroll = self
+                    .scroll
+                    .clamp(minimum_scroll.min(maximum_scroll), maximum_scroll)
+                    .clamp(0.0, max_scroll);
+            }
+        }
         let preview = rectangle::update(self, ui, &response, &geometries);
         let strides: Vec<_> = geometries.iter().map(|geometry| geometry.stride).collect();
         let old_clip = ui.clip_rect();
@@ -235,28 +284,42 @@ impl EditorApp {
                 51,
             );
             let context_capture = crate::app::script_context::capture(ui, block, geometry.editor);
-            let edit = ui.put(
-                geometry.editor,
-                TextEdit::multiline(&mut block.text)
-                    .id(egui::Id::new(("block-text", block.id)))
-                    .frame(egui::Frame::NONE.inner_margin(egui::Margin {
-                        left: 0,
-                        right: 2,
-                        top: 2,
-                        bottom: 4,
-                    }))
-                    .desired_rows(1)
-                    .font(style::font(em))
-                    .layouter(&mut layouter)
-                    .return_key(
-                        newline.then_some(egui::KeyboardShortcut::new(modifiers, egui::Key::Enter)),
-                    )
-                    .hint_text(crate::app::i18n::tr(
-                        locale,
-                        "クリックしてセリフを入力してください",
-                        "Click to enter speech",
-                    )),
-            );
+            let edit = ui
+                .scope_builder(
+                    egui::UiBuilder::new().max_rect(geometry.editor).layout(
+                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    ),
+                    |ui| {
+                        TextEdit::multiline(&mut block.text)
+                            .id(egui::Id::new(("block-text", block.id)))
+                            .frame(egui::Frame::NONE.inner_margin(script_layout::TEXT_MARGIN))
+                            .desired_rows(1)
+                            .font(style::font(em))
+                            .layouter(&mut layouter)
+                            .return_key(newline.then_some(egui::KeyboardShortcut::new(
+                                modifiers,
+                                egui::Key::Enter,
+                            )))
+                            .hint_text(crate::app::i18n::tr(
+                                locale,
+                                "クリックしてセリフを入力してください",
+                                "Click to enter speech",
+                            ))
+                            .show(ui)
+                    },
+                )
+                .inner;
+            if !edit.response.response.changed()
+                && let Some(cursor) = &self.playback_guide.word
+                && cursor.block == block_id
+                && let Some(chars) = &cursor.chars
+            {
+                script_playback::highlight(ui.painter(), &edit, chars.clone(), narrator_color);
+            }
+            let caret = edit
+                .cursor_range
+                .map(|range| usize::from(range.primary.index));
+            let edit = edit.response.response;
             ui.visuals_mut().selection.bg_fill = selection_fill;
             if edit.changed() {
                 block.segments.clear();
@@ -338,6 +401,16 @@ impl EditorApp {
             if (edit.clicked() || edit.gained_focus()) && !select.clicked() {
                 let modifiers = ui.input(|input| input.modifiers);
                 self.click_block(index, modifiers.shift, modifiers.ctrl);
+                if !modifiers.shift
+                    && !modifiers.ctrl
+                    && !edit.changed()
+                    && !composing
+                    && let Some(caret) = caret
+                    && let Some(time) = self.playback_guide.text_position(block_id, caret)
+                {
+                    self.seek_to_word(time);
+                    ui.ctx().request_repaint();
+                }
             }
             if edit.changed() {
                 self.begin_edit();

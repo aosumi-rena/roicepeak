@@ -19,7 +19,7 @@ pub(crate) struct Pending {
 struct Basis {
     source: Project,
     config: Option<Config>,
-    dictionary_path: PathBuf,
+    dictionary_path: Option<PathBuf>,
     dictionary: Snapshot,
 }
 
@@ -37,14 +37,14 @@ impl EditorApp {
     fn save_dictionary_path(&self) -> Option<PathBuf> {
         self.render_config
             .as_ref()
-            .map(|config| config.dictionary.clone())
+            .and_then(|config| config.dictionary.clone())
             .or_else(|| self.resources.dictionary.clone())
     }
 
     fn save_basis_current(&self, basis: &Basis) -> bool {
         save_revision::matches(&self.project, &basis.source)
             && self.render_config == basis.config
-            && self.save_dictionary_path().as_ref() == Some(&basis.dictionary_path)
+            && self.save_dictionary_path() == basis.dictionary_path
             && self.dictionary_state.matches(&basis.dictionary)
     }
 
@@ -68,10 +68,6 @@ impl EditorApp {
             .as_ref()
             .is_none_or(|basis| !self.save_basis_current(basis))
         {
-            let Some(dictionary_path) = self.save_dictionary_path() else {
-                self.error = Some("Select a dictionary path before saving new text".into());
-                return;
-            };
             let dictionary = match self.dictionary_snapshot() {
                 Ok(dictionary) => dictionary,
                 Err(error) => {
@@ -82,7 +78,7 @@ impl EditorApp {
             save.basis = Some(Basis {
                 source: self.project.clone(),
                 config: self.render_config.clone(),
-                dictionary_path,
+                dictionary_path: self.save_dictionary_path(),
                 dictionary,
             });
             save.generation = None;

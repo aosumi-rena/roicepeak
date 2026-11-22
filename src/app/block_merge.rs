@@ -28,10 +28,12 @@ impl Block {
         let mut authored_pending = Vec::new();
         let left_bytes = merged.text.len();
         if !incoming.is_empty()
-            && merged
-                .sentences
-                .last()
-                .is_some_and(|sentence| !crate::app::sentences::ends_with_delimiter(&sentence.text))
+            && merged.sentences.last().is_some_and(|sentence| {
+                !crate::app::sentences::ends_with_delimiter(
+                    &sentence.text,
+                    &merged.narrator.language,
+                )
+            })
         {
             let first = incoming.remove(0);
             let last = merged

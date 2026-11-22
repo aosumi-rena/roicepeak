@@ -40,7 +40,36 @@ fn font_step(ui: &mut egui::Ui, rect: Rect, id: egui::Id, sign: &str, enabled: b
 }
 
 impl EditorApp {
+    fn poll_audio_outputs(&mut self, ctx: &egui::Context) {
+        if !self.audio_outputs_scanned {
+            self.audio_outputs_scanned = true;
+            let (send, result) = std::sync::mpsc::sync_channel(1);
+            let repaint = ctx.clone();
+            if std::thread::Builder::new()
+                .name("roicepeak-audio-devices".into())
+                .spawn(move || {
+                    let _ = send.send(crate::app::audio::outputs().unwrap_or_default());
+                    repaint.request_repaint();
+                })
+                .is_ok()
+            {
+                self.audio_output_scan = Some(result);
+            }
+        }
+        if let Some(scan) = &self.audio_output_scan {
+            match scan.try_recv() {
+                Ok(outputs) => {
+                    self.audio_outputs = outputs;
+                    self.audio_output_scan = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.audio_output_scan = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
     pub fn preferences_content(&mut self, ui: &mut egui::Ui) {
+        self.poll_audio_outputs(ui.ctx());
         let origin = ui.max_rect().min;
         for (top, ja, en) in [
             (16.0, "ユーザーインターフェース", "User interface"),
@@ -313,8 +342,8 @@ impl EditorApp {
                     return;
                 };
                 let mut resources = self.resources.clone();
-                resources.preferred_voice = Some(voice.name.clone());
-                match resources.save() {
+                resources.preferred_voice = Some(voice.collection_name.clone());
+                match self.settings_state.save_now(&resources) {
                     Ok(()) => {
                         if let Some(draft) = &mut self.resource_draft {
                             draft.preferred_voice = resources.preferred_voice.clone();

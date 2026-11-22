@@ -70,19 +70,18 @@ pub(crate) fn identity_indices(catalog: &Catalog) -> Result<Vec<usize>, String> 
     let mut identities: Vec<usize> = Vec::new();
     for index in indices(catalog)? {
         let voice = &catalog.voices[index];
-        if let Some(&position) = positions.get(&voice.name) {
+        if let Some(&position) = positions.get(&voice.collection_name) {
             if voice.version > catalog.voices[identities[position]].version {
                 identities[position] = index;
             }
         } else {
-            positions.insert(voice.name.clone(), identities.len());
+            positions.insert(voice.collection_name.clone(), identities.len());
             identities.push(index);
         }
     }
     Ok(identities)
 }
 
-/// The desktop frontend currently prepares Japanese; language is not inferred from a bank.
 pub(crate) fn resolve_choice(
     catalog: &Catalog,
     current: &VoiceRef,
@@ -91,16 +90,18 @@ pub(crate) fn resolve_choice(
     let choice = catalog
         .instance(choice_key)
         .ok_or("Selected narrator is unavailable")?;
-    if current.identity == choice.name {
+    if current.identity == choice.collection_name {
         return Ok(current.clone());
     }
     let mut reference = VoiceRef {
-        identity: choice.name.clone(),
+        identity: choice.collection_name.clone(),
         language: current.language.clone(),
         version: current.version.clone(),
     };
+    catalog.select_available_language(&mut reference);
     if catalog.voice(&reference).is_none() {
         reference.version = VoiceVersion::Latest;
+        catalog.select_available_language(&mut reference);
     }
     Ok(reference)
 }

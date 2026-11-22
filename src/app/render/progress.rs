@@ -24,14 +24,11 @@ struct Unit {
 }
 
 pub struct ProgressBasis {
-    source: Project,
-    user_dictionary: crate::app::dictionary::Snapshot,
-    config: Config,
+    prepared: Arc<PreparedProject>,
     units: Vec<Unit>,
     groups: BTreeMap<u64, std::ops::Range<usize>>,
     source_index: BTreeMap<u64, usize>,
     starts: BTreeMap<u64, f64>,
-    samples: usize,
 }
 
 impl ProgressBasis {
@@ -50,10 +47,7 @@ impl ProgressBasis {
             .iter()
             .map(|b| b.sentence_ranges())
             .collect();
-        let dictionary: Arc<[Stamp]> = prepared
-            .units
-            .first()
-            .map_or_else(|| Arc::from([]), |u| Arc::from(u.dictionary_stamp.clone()));
+        let mut dictionaries = BTreeMap::<&str, Arc<[Stamp]>>::new();
         let mut units = Vec::with_capacity(prepared.units.len());
         let mut previous = None;
         let mut model: Arc<[Stamp]> = Arc::from([]);
@@ -61,6 +55,10 @@ impl ProgressBasis {
             let index = *source_index
                 .get(&unit.block)
                 .ok_or("Unknown prepared progress block")?;
+            let language = prepared.source.blocks[index].narrator.language.as_str();
+            let dictionary = dictionaries
+                .entry(language)
+                .or_insert_with(|| Arc::from(unit.dictionary_stamp.clone()));
             if ranges[index].get(unit.sentence.index) != Some(&unit.sentence)
                 || unit.dictionary_stamp.as_slice() != dictionary.as_ref()
                 || !unit.duration.is_finite()
@@ -88,14 +86,11 @@ impl ProgressBasis {
                 duration: unit.duration,
                 samples: samples.round() as usize,
                 model: Arc::clone(&model),
-                dictionary: Arc::clone(&dictionary),
+                dictionary: Arc::clone(dictionary),
             });
             groups.get_mut(&unit.block).unwrap().end = units.len();
         }
         let basis = Arc::new(Self {
-            source: prepared.source,
-            user_dictionary: prepared.user_dictionary,
-            config: prepared.config,
             units,
             groups,
             source_index,
@@ -104,9 +99,9 @@ impl ProgressBasis {
                 .iter()
                 .map(|block| (block.id, block.start))
                 .collect(),
-            samples: prepared.samples,
+            prepared: Arc::new(prepared),
         });
-        if basis.geometry(None)?.1 != basis.samples {
+        if basis.geometry(None)?.1 != basis.prepared.samples {
             return Err("Prepared progress total disagrees with placement".into());
         }
         Ok(basis)
@@ -123,9 +118,9 @@ impl ProgressBasis {
                     .ok_or("Unknown export progress block")?;
                 index..index + 1
             }
-            None => 0..self.source.blocks.len(),
+            None => 0..self.prepared.source.blocks.len(),
         };
-        for block in &self.source.blocks[indices] {
+        for block in &self.prepared.source.blocks[indices] {
             let range = self.groups.get(&block.id).cloned().unwrap_or(0..0);
             let durations: Vec<_> = self.units[range.clone()]
                 .iter()
@@ -154,7 +149,7 @@ impl ProgressBasis {
 
     pub fn samples(&self, selected: Option<u64>) -> Result<usize, String> {
         if selected.is_none() {
-            Ok(self.samples)
+            Ok(self.prepared.samples)
         } else {
             self.geometry(selected).map(|v| v.1)
         }
@@ -166,9 +161,12 @@ impl ProgressBasis {
         config: &Config,
         user_dictionary: &crate::app::dictionary::Snapshot,
     ) -> bool {
-        self.source.same_content(source)
-            && self.config == *config
-            && self.user_dictionary.same(user_dictionary)
+        self.prepared.matches(source, config, user_dictionary)
+    }
+
+    pub(crate) fn playback(&self, request: &Request) -> Option<Arc<PreparedProject>> {
+        self.matches(&request.project, &request.config, &request.user_dictionary)
+            .then(|| Arc::clone(&self.prepared))
     }
 
     pub fn block_start(&self, block: u64) -> Option<f64> {
@@ -180,14 +178,19 @@ impl ProgressBasis {
             Some(id) => self
                 .source_index
                 .get(&id)
-                .is_some_and(|index| !self.source.blocks[*index].has_synthesis_units()),
-            None => self.source.blocks.iter().all(|b| !b.has_synthesis_units()),
+                .is_some_and(|index| !self.prepared.source.blocks[*index].has_synthesis_units()),
+            None => self
+                .prepared
+                .source
+                .blocks
+                .iter()
+                .all(|b| !b.has_synthesis_units()),
         }
     }
 
     pub fn plan(self: &Arc<Self>, selected: Option<u64>) -> Result<ProgressPlan, String> {
         let (entries, total) = self.geometry(selected)?;
-        let mut source = self.source.clone();
+        let mut source = self.prepared.source.clone();
         if let Some(id) = selected {
             source.blocks.retain(|b| b.id == id);
             for block in &mut source.blocks {
@@ -207,9 +210,9 @@ impl ProgressBasis {
         }
         Ok(ProgressPlan {
             request: Request {
-                config: self.config.clone(),
+                config: self.prepared.config.clone(),
                 project: source,
-                user_dictionary: self.user_dictionary.clone(),
+                user_dictionary: self.prepared.user_dictionary.clone(),
             },
             pending: Pending {
                 basis: Arc::clone(self),

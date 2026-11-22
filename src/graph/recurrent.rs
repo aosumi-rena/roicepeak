@@ -123,6 +123,49 @@ impl Gru {
         let mut state = vec![0.0; self.hidden];
         self.run_state(input, reverse, &mut state, budget)
     }
+
+    pub(super) fn run_directions(
+        &self,
+        backward: &Self,
+        input: &Tensor,
+        budget: &mut Budget,
+    ) -> Result<(Tensor, Tensor)> {
+        if input.cols() != self.inputs || input.cols() != backward.inputs {
+            return Err(invalid("GRU input dimension"));
+        }
+        let cost = |model: &Self| {
+            let (macs, elements) = model.state_cost(input.rows());
+            Budget {
+                multiply_adds: macs,
+                output_elements: elements.saturating_add(model.hidden),
+            }
+        };
+        let mut forward_budget = cost(self);
+        let mut backward_budget = cost(backward);
+        if forward_budget
+            .multiply_adds
+            .min(backward_budget.multiply_adds)
+            >= super::parallel::MIN_PARALLEL_MACS
+            && let Some(pool) = super::parallel::pool()
+        {
+            // Charge both directions before scheduling either pass.
+            for branch in [&forward_budget, &backward_budget] {
+                budget.spend(branch.multiply_adds, branch.output_elements)?;
+            }
+            let (forward, reverse) = pool.install(|| {
+                rayon::join(
+                    || self.run(input, false, &mut forward_budget),
+                    || backward.run(input, true, &mut backward_budget),
+                )
+            });
+            Ok((forward?, reverse?))
+        } else {
+            Ok((
+                self.run(input, false, budget)?,
+                backward.run(input, true, budget)?,
+            ))
+        }
+    }
     pub(super) fn run_state(
         &self,
         input: &Tensor,
@@ -132,23 +175,7 @@ impl Gru {
     ) -> Result<Tensor> {
         self.run_state_observed(input, reverse, state, budget, |_, _, _| Ok(()))
     }
-    pub(super) fn run_state_observed(
-        &self,
-        input: &Tensor,
-        reverse: bool,
-        state: &mut [f32],
-        budget: &mut Budget,
-        mut observe: impl FnMut(usize, Stage, &[f32]) -> Result<()>,
-    ) -> Result<Tensor> {
-        if input.cols() != self.inputs {
-            return Err(invalid("GRU input dimension"));
-        }
-        if state.len() != self.hidden || state.iter().any(|v| !v.is_finite()) {
-            return Err(invalid("GRU hidden-state dimension or values"));
-        }
-        if input.rows() == 0 {
-            return Tensor::zeros(0, self.hidden);
-        }
+    fn state_cost(&self, rows: usize) -> (usize, usize) {
         let quantized = self.matrices[0].is_quantized();
         let products = self.matrices.iter().fold(0usize, |total, matrix| {
             total.saturating_add(matrix.elements())
@@ -171,17 +198,35 @@ impl Gru {
             .hidden
             .saturating_mul(4)
             .saturating_add(matrix_workspace);
-        budget.spend(
-            input.rows().saturating_mul(
+        (
+            rows.saturating_mul(
                 products
                     .saturating_add(quantization)
                     .saturating_add(vector_and_activation),
             ),
-            input
-                .rows()
-                .saturating_mul(self.hidden)
-                .saturating_add(scratch),
-        )?;
+            rows.saturating_mul(self.hidden).saturating_add(scratch),
+        )
+    }
+
+    pub(super) fn run_state_observed(
+        &self,
+        input: &Tensor,
+        reverse: bool,
+        state: &mut [f32],
+        budget: &mut Budget,
+        mut observe: impl FnMut(usize, Stage, &[f32]) -> Result<()>,
+    ) -> Result<Tensor> {
+        if input.cols() != self.inputs {
+            return Err(invalid("GRU input dimension"));
+        }
+        if state.len() != self.hidden || state.iter().any(|v| !v.is_finite()) {
+            return Err(invalid("GRU hidden-state dimension or values"));
+        }
+        if input.rows() == 0 {
+            return Tensor::zeros(0, self.hidden);
+        }
+        let (macs, elements) = self.state_cost(input.rows());
+        budget.spend(macs, elements)?;
         let mut output = Tensor::zeros(input.rows(), self.hidden)?;
         let mut hidden = state.to_vec();
         let mut reset = vec![0.0; self.hidden];

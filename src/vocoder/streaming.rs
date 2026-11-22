@@ -1,8 +1,8 @@
 mod buffers;
 mod trace;
 use super::{
-    Render, Vocoder, dsp, effects::SpectrumKind, lf_excitation, lf_math::Mode, lf_window,
-    postfilter_log, response_exp, shape_transfer,
+    Render, Vocoder, VocoderModel, dsp, effects::SpectrumKind, lf_excitation, lf_math::Mode,
+    lf_window, postfilter_log, response_exp, shape_transfer,
 };
 use crate::{
     Result,
@@ -16,8 +16,10 @@ use crate::{
 };
 use trace::Trace;
 
+const PACKET_FRAMES: usize = 16;
+
 struct Pipeline<'a> {
-    model: &'a Vocoder,
+    model: &'a VocoderModel,
     fused: bool,
     shape: Network<'a>,
     trunk: Network<'a>,
@@ -48,11 +50,12 @@ struct Pipeline<'a> {
 }
 
 impl<'a> Pipeline<'a> {
-    fn new(model: &'a Vocoder, tension: f32) -> Result<Self> {
+    fn new(vocoder: &'a Vocoder, tension: f32, intermediates: bool) -> Result<Self> {
         let fused = postfilter_log::fused_available();
+        let model = vocoder.model.as_ref();
         let effect = |kind| {
-            model.effects.active(tension).then_some((
-                &model.effects,
+            vocoder.effects.active(tension).then_some((
+                &vocoder.effects,
                 kind,
                 tension,
                 model.sample_rate,
@@ -88,7 +91,7 @@ impl<'a> Pipeline<'a> {
             band_rows: Rows::default(),
             harmonic_pcm: Rows::default(),
             noise_pcm: Rows::default(),
-            trace: Trace::default(),
+            trace: Trace::new(intermediates),
             produced: 0,
             finished: false,
         })
@@ -281,12 +284,81 @@ impl<'a> Pipeline<'a> {
     }
 }
 
+pub(crate) struct PcmPackets<'a> {
+    pipeline: Pipeline<'a>,
+    input: Rows,
+    expected_frames: usize,
+    received: usize,
+}
+
+impl<'a> PcmPackets<'a> {
+    pub(crate) fn new(
+        model: &'a Vocoder,
+        frames: usize,
+        tension: f32,
+        budget: &mut Budget,
+    ) -> Result<Self> {
+        if !tension.is_finite() || frames == 0 || frames > MAX_ELEMENTS / dsp::HOP {
+            return Err(invalid("vocoder stream length or tension"));
+        }
+        budget.spend(0, frames * dsp::HOP)?;
+        Ok(Self {
+            pipeline: Pipeline::new(model, tension, false)?,
+            input: Rows::default(),
+            expected_frames: frames,
+            received: 0,
+        })
+    }
+
+    pub(crate) fn feed(
+        &mut self,
+        physical: &Tensor,
+        end: bool,
+        budget: &mut Budget,
+        emit: &mut dyn FnMut(&[f32]) -> Result<()>,
+    ) -> Result<()> {
+        if physical.cols() != 72 || self.input.input_ended() {
+            return Err(invalid("vocoder packet dimensions or end"));
+        }
+        self.received += physical.rows();
+        if self.received > self.expected_frames || (end && self.received != self.expected_frames) {
+            return Err(invalid("vocoder packet frame count"));
+        }
+        self.input.push(Some(physical), end, budget)?;
+        while self.input.rows() > PACKET_FRAMES || (end && self.input.rows() != 0) {
+            let allocation_limit = budget.output_elements;
+            let packet = self
+                .input
+                .take(self.input.rows().min(PACKET_FRAMES), budget)?
+                .ok_or_else(|| invalid("missing vocoder packet"))?;
+            self.pipeline
+                .feed(&packet, self.input.end(), budget, emit)?;
+            budget.output_elements = allocation_limit;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<Tensor> {
+        if !self.pipeline.finished || self.pipeline.produced != self.expected_frames * dsp::HOP {
+            return Err(invalid(
+                "vocoder stream did not finish at its prepared length",
+            ));
+        }
+        self.pipeline
+            .trace
+            .finish()?
+            .remove("pcm")
+            .ok_or_else(|| invalid("vocoder did not return PCM"))
+    }
+}
+
 pub(super) fn render(
     model: &Vocoder,
     physical: &Tensor,
     tension: f32,
     budget: &mut Budget,
     emit: &mut dyn FnMut(&[f32]) -> Result<()>,
+    intermediates: bool,
 ) -> Result<Render> {
     if !tension.is_finite()
         || physical.cols() != 72
@@ -297,9 +369,16 @@ pub(super) fn render(
             "vocoder requires nonempty bounded 72-channel frames",
         ));
     }
-    let mut pipeline = Pipeline::new(model, tension)?;
-    for first in (0..physical.rows()).step_by(16) {
-        let end = (first + 16).min(physical.rows());
+    let mut pipeline = Pipeline::new(model, tension, intermediates)?;
+    let packet_allocation_limit = if intermediates {
+        None
+    } else {
+        // Retain one PCM result and reuse the allocation allowance for packet scratch.
+        budget.spend(0, physical.rows() * dsp::HOP)?;
+        Some(budget.output_elements)
+    };
+    for first in (0..physical.rows()).step_by(PACKET_FRAMES) {
+        let end = (first + PACKET_FRAMES).min(physical.rows());
         budget.spend(0, (end - first) * physical.cols())?;
         let packet = Tensor::new(
             end - first,
@@ -307,6 +386,9 @@ pub(super) fn render(
             physical.values()[first * physical.cols()..end * physical.cols()].to_vec(),
         )?;
         pipeline.feed(&packet, end == physical.rows(), budget, emit)?;
+        if let Some(limit) = packet_allocation_limit {
+            budget.output_elements = limit;
+        }
     }
     if !pipeline.finished || pipeline.produced != physical.rows() * dsp::HOP {
         return Err(invalid(

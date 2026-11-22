@@ -1,6 +1,10 @@
 //! Ordered lane equations for the generated x64 activation backend.
 #![cfg(target_arch = "x86_64")]
 
+#[allow(unsafe_code)]
+#[path = "generated_activation_fma.rs"]
+mod fma;
+
 use safe_arch::{
     add_m128, bitand_m128, bitandnot_m128, bitor_m128, cmp_lt_mask_m128, cmp_nlt_mask_m128,
     div_m128, m128, mul_m128, reciprocal_m128, sub_m128,
@@ -10,6 +14,15 @@ use safe_arch::{
 pub enum Kind {
     Tanh,
     Sigmoid,
+}
+impl Kind {
+    fn coefficients(self) -> [f32; 3] {
+        match self {
+            Self::Tanh => [0x3e06_0807, 0x3f19_8f1d, 0x3f7b_fbbd],
+            Self::Sigmoid => [0x3c06_0568, 0x3e19_4af5, 0x3efb_fc65],
+        }
+        .map(f32::from_bits)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,13 +70,24 @@ impl Kernel {
         if input.len() != output.len() {
             return Err(LengthMismatch);
         }
-        for (source, target) in input.chunks(4).zip(output.chunks_mut(4)) {
-            let mut values = [0.0; 4];
-            values[..source.len()].copy_from_slice(source);
-            let result = self.lanes(kind, values);
-            target.copy_from_slice(&result[..target.len()]);
-        }
+        output.copy_from_slice(input);
+        self.apply_in_place(kind, output);
         Ok(())
+    }
+
+    pub fn apply_in_place(self, kind: Kind, values: &mut [f32]) {
+        if self.arithmetic == Arithmetic::Fused && fma::apply(kind, values) {
+            return;
+        }
+        let (groups, tail) = values.as_chunks_mut::<4>();
+        for group in groups {
+            *group = self.lanes(kind, *group);
+        }
+        if !tail.is_empty() {
+            let mut input = [0.0; 4];
+            input[..tail.len()].copy_from_slice(tail);
+            tail.copy_from_slice(&self.lanes(kind, input)[..tail.len()]);
+        }
     }
 
     fn lanes(self, kind: Kind, values: [f32; 4]) -> [f32; 4] {
@@ -72,11 +96,7 @@ impl Kernel {
         let zero = m128::from_array([0.0; 4]);
         let absolute = m128::from_bits(values.map(|v| v.to_bits() & 0x7fff_ffff));
         let square = mul_m128(x, x);
-        let [c, b, a] = match kind {
-            Kind::Tanh => [0x3e06_0807, 0x3f19_8f1d, 0x3f7b_fbbd],
-            Kind::Sigmoid => [0x3c06_0568, 0x3e19_4af5, 0x3efb_fc65],
-        }
-        .map(f32::from_bits);
+        let [c, b, a] = kind.coefficients();
         let polynomial = match self.arithmetic {
             Arithmetic::Separate => {
                 let p = add_m128(

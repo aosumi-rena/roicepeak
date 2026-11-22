@@ -110,6 +110,11 @@ impl EditorApp {
                 }
                 self.filename = Some(path);
                 self.selection.clear();
+                self.scroll = 0.0;
+                if let Some(first) = self.project.blocks.first() {
+                    self.playhead = first.timestamp;
+                    self.selection.select_only(first.id);
+                }
                 self.dirty = false;
                 self.undo.clear();
                 self.redo.clear();

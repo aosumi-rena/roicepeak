@@ -55,6 +55,7 @@ mod save_revision;
 mod save_worker;
 mod script_context;
 mod script_interactions;
+mod script_playback;
 mod script_view;
 mod sentence_edit;
 mod sentences;

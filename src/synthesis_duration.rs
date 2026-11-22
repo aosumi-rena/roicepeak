@@ -1,5 +1,10 @@
 use super::{DurationEdit, Edits};
-use crate::{Result, invalid, phonemes::Encoded, stylebook::Style, tensor::Tensor};
+use crate::{
+    Result, invalid,
+    phonemes::{Encoded, Token},
+    stylebook::Style,
+    tensor::Tensor,
+};
 
 pub(super) fn raw(x: &Encoded, predicted: &Tensor, style: &Style, period: f32) -> Result<Vec<f32>> {
     let n = x.linguistic.rows();
@@ -32,6 +37,49 @@ pub(super) fn raw(x: &Encoded, predicted: &Tensor, style: &Style, period: f32) -
             Ok(seconds)
         })
         .collect()
+}
+
+pub(super) fn apply_english_stress(
+    encoded: &Encoded,
+    prosody: &Tensor,
+    tokens: &[Token],
+    period: f32,
+    seconds: &mut [f32],
+) {
+    let weight = |index| match prosody.row(index)[0] as u32 {
+        0x4001 => 1.30,
+        0x4002 => 1.14,
+        _ => 1.0,
+    };
+    let frame_period = f64::from(period);
+    let frames = |seconds| (f64::from(seconds) / frame_period).round();
+    let mut first = 0;
+    for phones in encoded.references.chunk_by(|a, b| a[0] == b[0]) {
+        let end = first + phones.len();
+        let token = &tokens[phones[0][0]];
+        if token.language == 3 && token.syllables.len() > 1 {
+            let nuclei = (first..end).filter(|&index| encoded.nucleus[index]);
+            let (total, weighted) = nuclei.clone().fold((0.0, 0.0), |(total, weighted), index| {
+                let adjustable = (frames(seconds[index]) - 1.0).max(0.0);
+                (total + adjustable, weighted + adjustable * weight(index))
+            });
+            if weighted > total {
+                // Keep the word's total duration and its existing minimum vowel frames.
+                let mut position = 0.0;
+                let mut previous = 0.0;
+                for index in nuclei {
+                    let original = frames(seconds[index]);
+                    if original > 1.0 {
+                        position += (original - 1.0) * weight(index);
+                        let next = (position * total / weighted).round();
+                        seconds[index] = ((1.0 + next - previous) * frame_period) as f32;
+                        previous = next;
+                    }
+                }
+            }
+        }
+        first = end;
+    }
 }
 
 pub(super) struct Plan {

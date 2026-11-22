@@ -12,24 +12,44 @@ pub(super) fn scaled_exp(value: f32, scale: f32) -> f32 {
     if value > 229.0 {
         return f32::INFINITY.copysign(scale);
     }
+    let (exponent, factor) = decompose(value);
+    scale_binary(factor.map_or(scale, |factor| factor * scale), exponent)
+}
+
+pub(super) fn scaled_exp_pair(value: f32, scales: [f32; 2]) -> [f32; 2] {
+    debug_assert!(value.is_finite() && scales.iter().all(|value| value.is_finite()));
+    if !(-229.0..=229.0).contains(&value) {
+        return scales.map(|scale| scaled_exp(value, scale));
+    }
+    let (exponent, factor) = decompose(value);
+    scales.map(|scale| {
+        if scale == 0.0 {
+            scale
+        } else {
+            scale_binary(factor.map_or(scale, |factor| factor * scale), exponent)
+        }
+    })
+}
+
+fn decompose(value: f32) -> (i32, Option<f32>) {
     let power = value * f32::from_bits(0x3fb8aa3b);
     let rounded = power + if power < 0.0 { -0.5 } else { 0.5 };
     let mut exponent = rounded as i32;
     let high = exponent as f32 * f32::from_bits(0x3f317200);
     let low = exponent as f32 * f32::from_bits(0x35bfbe8e);
     let residual = (value - high) - low;
-    let fraction =
-        if residual > -f32::from_bits(0x33000000) && residual < f32::from_bits(0x33000000) {
-            scale
-        } else {
-            exponent -= 1;
-            let square = residual * residual;
-            let odd = (square + f32::from_bits(0x42705d55)) * residual;
-            let even = square * f32::from_bits(0x41403e28) + f32::from_bits(0x42f05d55);
-            let quotient = (odd + even) / (even - odd);
-            (quotient * 2.0) * scale
-        };
-    scale_binary(fraction, exponent)
+    let factor = if residual > -f32::from_bits(0x33000000) && residual < f32::from_bits(0x33000000)
+    {
+        None
+    } else {
+        exponent -= 1;
+        let square = residual * residual;
+        let odd = (square + f32::from_bits(0x42705d55)) * residual;
+        let even = square * f32::from_bits(0x41403e28) + f32::from_bits(0x42f05d55);
+        let quotient = (odd + even) / (even - odd);
+        Some(quotient * 2.0)
+    };
+    (exponent, factor)
 }
 
 // Round subnormal results once, to nearest with ties to even.

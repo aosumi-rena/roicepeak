@@ -165,30 +165,50 @@ impl WordState {
         true
     }
     pub fn replace_reading(&mut self, baseline: &Self, token: &Token) -> bool {
-        let reading: String = token.syllables.iter().map(|m| m.reading.as_str()).collect();
-        if reading == self.reading() {
+        if self.same_pronunciation(&token.syllables) {
             return false;
         }
-        if reading == baseline.reading() {
+        if baseline.same_pronunciation(&token.syllables) {
             return self.reset_reading(baseline);
         }
-        self.morae = Self::from_token(token, &vec![true; token.syllables.len()]).morae;
-        for (index, mora) in self.morae.iter_mut().enumerate() {
-            for phone in &mut mora.phones {
-                phone.stored_nucleus = false;
-            }
-            mora.code = if self.language == 1 {
-                if index == 0 {
+        let predict = self.language == 1;
+        self.morae = Self::from_token(token, &vec![predict; token.syllables.len()]).morae;
+        if predict {
+            for (index, mora) in self.morae.iter_mut().enumerate() {
+                for phone in &mut mora.phones {
+                    phone.stored_nucleus = false;
+                }
+                mora.code = if index == 0 {
                     roicepeak::phonemes::LOW
                 } else {
                     roicepeak::phonemes::HIGH
-                }
-            } else {
-                roicepeak::phonemes::NONE
-            };
+                };
+            }
         }
         self.pronunciation_edited = true;
         true
+    }
+
+    fn same_pronunciation(&self, syllables: &[Syllable]) -> bool {
+        if self.language == 1 {
+            return syllables
+                .iter()
+                .map(|syllable| syllable.reading.as_str())
+                .collect::<String>()
+                == self.reading();
+        }
+        self.morae.len() == syllables.len()
+            && self.morae.iter().zip(syllables).all(|(stored, syllable)| {
+                stored.code == syllable.code
+                    && stored.phones.len() == syllable.phones.len()
+                    && stored
+                        .phones
+                        .iter()
+                        .zip(&syllable.phones)
+                        .all(|(left, right)| {
+                            left.symbol == right.symbol && left.nucleus == right.nucleus
+                        })
+            })
     }
     fn from_token(token: &Token, predict: &[bool]) -> Self {
         Self {
@@ -220,7 +240,7 @@ impl WordState {
                 .collect(),
         }
     }
-    fn token(&self) -> Token {
+    pub(crate) fn token(&self) -> Token {
         Token {
             text: self.surface.clone(),
             language: self.language,
@@ -355,7 +375,7 @@ pub fn pronunciation_query(
         let old = &saved[oi[a]];
         let index = ni[b];
         let new = &fresh[index];
-        if old.pronunciation_edited {
+        if old.pronunciation_edited && old.language == new.language {
             tokens[index] = Token {
                 text: new.surface.clone(),
                 language: new.language,
@@ -429,12 +449,13 @@ fn retain(old: &WordState, new: &mut WordState) {
         kept.pos = new.pos;
         kept.language = new.language;
         for (a, b) in kept.morae.iter_mut().zip(&new.morae) {
-            if !a.accent_edited {
+            if !a.accent_edited && (!kept.pronunciation_edited || kept.language == 1) {
                 a.code = b.code;
             }
         }
         *new = kept;
-    } else if old.surface == new.surface && old.pronunciation_edited {
+    } else if old.surface == new.surface && old.language == new.language && old.pronunciation_edited
+    {
         *new = old.clone();
     }
 }

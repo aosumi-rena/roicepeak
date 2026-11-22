@@ -1,4 +1,5 @@
 //! Modern pitch and timbre stages. Inputs remain explicit and independently comparable.
+pub(crate) mod streaming;
 use crate::{
     Result,
     dnni::Node,
@@ -149,30 +150,9 @@ impl PitchModel {
         noise: Option<&Tensor>,
         budget: &mut Budget,
     ) -> Result<Tensor> {
-        if speaker_vector.len() != self.speaker_channels
-            || speaker_vector.iter().any(|v| !v.is_finite())
-        {
-            return Err(invalid("pitch speaker vector dimensions"));
-        }
         let counts = durations(controls, linguistic.rows())?;
-        if style.len() != self.style_channels {
-            return Err(invalid("pitch style width"));
-        }
-        let values = controls
-            .values()
-            .chunks_exact(3)
-            .map(|r| if r[1] == 1.0 { r[0] } else { 0.5 })
-            .collect::<Vec<_>>();
-        let encoded = self.lingual.run(linguistic, budget)?;
-        let hidden = self.recurrent.run_with(&encoded, budget)?;
-        let bank = cosine_bank(&values, self.bank_channels, budget)?;
-        let style = broadcast(style, linguistic.rows(), budget)?;
-        let phone_input = concatenate(&[&hidden, &bank, &style], budget)?;
-        let encoded = self.phone_stack.run_with(&phone_input, budget)?;
-        let expanded = repeat(&encoded, &counts, budget)?;
-        let bank = cosine_bank(&positions(&counts)?, 4, budget)?;
-        let speaker = broadcast(speaker_vector, expanded.rows(), budget)?;
-        let input = concatenate(&[&expanded, &bank, &speaker], budget)?;
+        let input =
+            self.frame_inputs(linguistic, controls, style, speaker_vector, &counts, budget)?;
         let features = self.pointwise.run_with(&input, budget)?;
         let context = self.convolution.run_with(&input, budget)?;
         let generated;
@@ -191,6 +171,40 @@ impl PitchModel {
         };
         self.sampler
             .run(&features, &context, noise, 0.6, 0.5, budget)
+    }
+
+    fn frame_inputs(
+        &self,
+        linguistic: &Tensor,
+        controls: &Tensor,
+        style: &[f32],
+        speaker_vector: &[f32],
+        counts: &[usize],
+        budget: &mut Budget,
+    ) -> Result<Tensor> {
+        if speaker_vector.len() != self.speaker_channels
+            || speaker_vector.iter().any(|v| !v.is_finite())
+        {
+            return Err(invalid("pitch speaker vector dimensions"));
+        }
+        if style.len() != self.style_channels {
+            return Err(invalid("pitch style width"));
+        }
+        let values = controls
+            .values()
+            .chunks_exact(3)
+            .map(|r| if r[1] == 1.0 { r[0] } else { 0.5 })
+            .collect::<Vec<_>>();
+        let encoded = self.lingual.run(linguistic, budget)?;
+        let hidden = self.recurrent.run_with(&encoded, budget)?;
+        let bank = cosine_bank(&values, self.bank_channels, budget)?;
+        let style = broadcast(style, linguistic.rows(), budget)?;
+        let phone_input = concatenate(&[&hidden, &bank, &style], budget)?;
+        let encoded = self.phone_stack.run_with(&phone_input, budget)?;
+        let expanded = repeat(&encoded, counts, budget)?;
+        let bank = cosine_bank(&positions(counts)?, 4, budget)?;
+        let speaker = broadcast(speaker_vector, expanded.rows(), budget)?;
+        concatenate(&[&expanded, &bank, &speaker], budget)
     }
     pub fn to_hz(&self, normalized: &Tensor) -> Result<Tensor> {
         self.acoustic.channels(1..2)?.denormalize(normalized)
@@ -368,28 +382,10 @@ impl AcousticDecoder {
         noise: Option<&Tensor>,
         budget: &mut Budget,
     ) -> Result<Tensor> {
-        if speaker_vector.len() != self.speaker_channels
-            || speaker_vector.iter().any(|v| !v.is_finite())
-        {
-            return Err(invalid("timbre speaker vector dimensions"));
-        }
         let counts = durations(controls, linguistic.rows())?;
-        if style.len() != self.style_channels || pitch.cols() != 1 {
-            return Err(invalid("timbre style/pitch widths"));
-        }
-        let encoded = self.lingual.run(linguistic, budget)?;
-        let expanded = repeat(&encoded, &counts, budget)?;
-        if expanded.rows() != pitch.rows() {
-            return Err(invalid("pitch frame count differs from duration sum"));
-        }
-        let position = cosine_bank(&positions(&counts)?, 4, budget)?;
-        let pitch_bank = cosine_bank(pitch.values(), 4, budget)?;
-        let speaker = broadcast(speaker_vector, expanded.rows(), budget)?;
-        let style = broadcast(style, expanded.rows(), budget)?;
-        let input = concatenate(
-            &[&expanded, &position, &pitch_bank, &speaker, &style],
-            budget,
-        )?;
+        let (expanded, position) = self.frame_content(linguistic, &counts, budget)?;
+        let input =
+            self.condition_frames(&expanded, &position, pitch, style, speaker_vector, budget)?;
         let context = self.convolution.run_with(&input, budget)?;
         let features = self.pointwise.run_with(&input, budget)?;
         let generated;
@@ -417,7 +413,56 @@ impl AcousticDecoder {
             &self.aux.run_conditioned(&context, &spectral, budget)?,
             budget,
         )?;
-        if spectral.cols() != 64 || aux.cols() != 7 {
+        self.physical(pitch, &spectral, &aux, budget)
+    }
+
+    fn frame_content(
+        &self,
+        linguistic: &Tensor,
+        counts: &[usize],
+        budget: &mut Budget,
+    ) -> Result<(Tensor, Tensor)> {
+        let encoded = self.lingual.run(linguistic, budget)?;
+        let expanded = repeat(&encoded, counts, budget)?;
+        let position = cosine_bank(&positions(counts)?, 4, budget)?;
+        Ok((expanded, position))
+    }
+
+    fn condition_frames(
+        &self,
+        expanded: &Tensor,
+        position: &Tensor,
+        pitch: &Tensor,
+        style: &[f32],
+        speaker_vector: &[f32],
+        budget: &mut Budget,
+    ) -> Result<Tensor> {
+        if speaker_vector.len() != self.speaker_channels
+            || speaker_vector.iter().any(|v| !v.is_finite())
+            || style.len() != self.style_channels
+            || pitch.cols() != 1
+            || expanded.rows() != pitch.rows()
+        {
+            return Err(invalid("timbre conditioning dimensions"));
+        }
+        let pitch_bank = cosine_bank(pitch.values(), 4, budget)?;
+        let speaker = broadcast(speaker_vector, expanded.rows(), budget)?;
+        let style = broadcast(style, expanded.rows(), budget)?;
+        concatenate(&[expanded, position, &pitch_bank, &speaker, &style], budget)
+    }
+
+    fn physical(
+        &self,
+        pitch: &Tensor,
+        spectral: &Tensor,
+        aux: &Tensor,
+        budget: &mut Budget,
+    ) -> Result<Tensor> {
+        if spectral.cols() != 64
+            || aux.cols() != 7
+            || spectral.rows() != pitch.rows()
+            || aux.rows() != pitch.rows()
+        {
             return Err(invalid(
                 "timbre output must have 64 spectral and 7 auxiliary channels",
             ));

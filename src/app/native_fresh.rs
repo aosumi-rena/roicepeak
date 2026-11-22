@@ -6,7 +6,6 @@ use crate::app::{
     document::{Block, OffsetMode, Parameters, Project, SentenceState, VoiceVersion},
     native_project::{NativeProject, TARGET_VERSION},
     render::Config,
-    sentences,
 };
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,20 +39,17 @@ fn block(block: &Block, config: &Config, emotions: &Value) -> Result<Value, Stri
         return Err("A new native document cannot contain retained native owners".into());
     }
     config.binding(&block.narrator)?;
-    let partition = if !block.sentences.is_empty() {
-        if block
+    if !block.sentences.is_empty()
+        && block
             .sentences
             .iter()
             .map(|sentence| sentence.text.as_str())
             .collect::<String>()
             != block.text
-        {
-            return Err("Native Save requires complete prepared sentence boundaries".into());
-        }
-        block.sentence_ranges()
-    } else {
-        sentences::partition(&block.text)
-    };
+    {
+        return Err("Native Save requires complete prepared sentence boundaries".into());
+    }
+    let partition = block.sentence_ranges();
     let list = if block.text.trim().is_empty() {
         if block.sentences.iter().any(|sentence| {
             sentence.ssml.is_some() || sentence.words.iter().any(|word| word.manual())
@@ -168,7 +164,7 @@ pub(super) fn encode(project: &Project, config: Option<&Config>) -> Result<Vec<u
     }
     let mut narrators = BTreeMap::<String, i32>::new();
     let mut keys = BTreeSet::<String>::new();
-    for source in &config.selections {
+    for source in config.selections.iter() {
         if source.identity.is_empty()
             || source.identity.len() > 4096
             || source.identity.contains('\0')

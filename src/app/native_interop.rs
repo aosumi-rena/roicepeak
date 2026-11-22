@@ -157,12 +157,9 @@ pub(crate) fn decode(native: NativeProject, config: Option<&Config>) -> Result<P
             if sentence
                 .words
                 .iter()
-                .any(|w| w.language != 1 || matches!(w.pos, 0x2000 | 0x2001))
+                .any(|w| matches!(w.pos, 0x2000 | 0x2001))
             {
-                return Err(
-                    "This editable native profile requires ordinary Japanese canonical words"
-                        .into(),
-                );
+                return Err("Native project contains a boundary token inside editable text".into());
             }
             sentence.native_owner = Some(origin.sentence_owner(index, si)?);
             let length = sentence.text.chars().count();

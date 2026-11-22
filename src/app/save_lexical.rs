@@ -6,7 +6,8 @@ use crate::app::{
 };
 use roicepeak::{
     frontend::{Tagger, UserDictionary, UserPartOfSpeech, UserWord},
-    japanese::{self, Pronunciation},
+    japanese::Pronunciation,
+    speech_frontend::Language,
 };
 use std::path::Path;
 
@@ -122,7 +123,7 @@ fn preserve(saved: &[WordState], fresh: &mut [WordState]) -> Result<(), String> 
 
 pub(crate) fn prepare(
     project: &Project,
-    dictionary_path: &Path,
+    dictionary_path: Option<&Path>,
     snapshot: &dictionary::Snapshot,
 ) -> Result<Project, String> {
     if !required(project)? {
@@ -139,25 +140,23 @@ pub(crate) fn prepare(
             let old_words = sentence.words.clone();
             let old_positions = sentence.word_positions.clone();
             if !current(sentence) {
-                if lexical.is_none() {
-                    let tagger = Tagger::open(dictionary_path, &[]).map_err(|e| e.to_string())?;
+                let language = Language::from_name(&block.narrator.language)
+                    .ok_or_else(|| format!("Unsupported language {}", block.narrator.language))?;
+                if language == Language::Japanese && lexical.is_none() {
+                    let path = dictionary_path
+                        .ok_or("Select a Japanese pronunciation dictionary in settings")?;
+                    let tagger = Tagger::open(path, &[]).map_err(|e| e.to_string())?;
                     let user = tagger
                         .user_dictionary(&dictionary_words(snapshot)?)
                         .map_err(|e| e.to_string())?;
                     lexical = Some((tagger, user));
                 }
-                let (tagger, user) = lexical.as_ref().ok_or("Save dictionary is unavailable")?;
-                let excluded = tagger
-                    .normalization_exclusions(&sentence.text, Some(user))
+                let analysis = language
+                    .analyze(
+                        &sentence.text,
+                        lexical.as_ref().map(|(tagger, user)| (tagger, user)),
+                    )
                     .map_err(|e| e.to_string())?;
-                let normalized = japanese::normalize_excluding(&sentence.text, &excluded)
-                    .map_err(|e| e.to_string())?;
-                let morphs = tagger
-                    .parse_with_user(&normalized, user)
-                    .map_err(|e| e.to_string())?;
-                let mut analysis = japanese::analyze(&morphs).map_err(|e| e.to_string())?;
-                analysis.input_text = Some(normalized);
-                analysis.normalization_exclusions = excluded;
                 let positions = WordPositions::from_analysis(&sentence.text, &analysis)?;
                 let mut words = state::from_analysis(&analysis)?;
                 preserve(&sentence.words, &mut words)?;

@@ -1,7 +1,7 @@
 use super::Convolution;
 use crate::{
     Result,
-    graph::{Budget, streaming::Packet},
+    graph::{Budget, profiling, streaming::Packet},
     invalid,
     tensor::{Tensor, checked_elements},
 };
@@ -86,15 +86,36 @@ impl<'a> Stream<'a> {
                 None
             }
         } else {
-            let output = self.model.run_range(
-                &self.input,
-                self.origin,
-                self.received,
-                self.next_output,
-                frames,
-                budget,
-            )?;
-            output.ensure_finite()?;
+            let timing = profiling::enter(
+                "streaming_convolution",
+                input.map_or(0, Tensor::rows),
+                channels,
+                budget.multiply_adds,
+            );
+            let output = self
+                .model
+                .run_range(
+                    &self.input,
+                    self.origin,
+                    self.received,
+                    self.next_output,
+                    frames,
+                    budget,
+                )
+                .and_then(|output| {
+                    output.ensure_finite()?;
+                    Ok(output)
+                });
+            if let Some(timing) = timing {
+                timing.finish(
+                    output
+                        .as_ref()
+                        .ok()
+                        .map(|value| (value.rows(), value.cols())),
+                    budget.multiply_adds,
+                );
+            }
+            let output = output?;
             Some(output)
         };
         self.next_output = ready;

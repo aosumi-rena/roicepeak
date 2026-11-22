@@ -31,7 +31,7 @@ impl State {
                         catalog
                             .voices
                             .iter()
-                            .find(|voice| voice.name == block.narrator.identity)
+                            .find(|voice| voice.collection_name == block.narrator.identity)
                     })
                     .map(|voice| voice.key.clone())
                     .unwrap_or_default();
@@ -66,8 +66,7 @@ impl State {
         for (index, key) in changes {
             let block = &mut project.blocks[index];
             if block.narrator != key {
-                block.narrator = key;
-                block.segments.clear();
+                block.set_narrator(key);
             }
         }
         Ok(())

@@ -58,7 +58,7 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
     let mut names: BTreeMap<String, String> = catalog
         .voices
         .iter()
-        .map(|voice| (voice.name.clone(), voice.name.clone()))
+        .map(|voice| (voice.collection_name.clone(), voice.name.clone()))
         .collect();
     for (key, name) in options.voice_names {
         if !names.contains_key(&key) {
@@ -67,12 +67,7 @@ pub(super) fn run(args: &[OsString]) -> Result<(), String> {
         names.insert(key, name);
     }
     let policy = locations.value_policy();
-    let mut config = render::Config::from_catalog(
-        locations
-            .dictionary
-            .ok_or("No pronunciation dictionary is available")?,
-        &catalog,
-    )?;
+    let mut config = render::Config::from_catalog(locations.dictionary, &catalog)?;
     config.value_policy = policy;
     let project = project_files::read(Path::new(&args[1]), Some(&config))?;
     let files = export::write_to_directory(

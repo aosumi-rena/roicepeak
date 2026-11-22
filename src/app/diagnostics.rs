@@ -229,7 +229,7 @@ fn run(command: &str, args: &[OsString]) -> Result<(), String> {
         || (command == "--render-stages" && (args.len() != 3 || prepare_first))
         || (command == "--render-text" && args.len() != 3)
         || (command == "--render-project" && args.len() != 2)
-        || (command == "--render-playback" && (args.len() != 2 || prepare_first))
+        || (command == "--render-playback" && args.len() != 2)
     {
         return Err("Usage: roicepeak --inspect-resources [--locations FILE] | --inspect-portrait [--locations FILE] VOICE_KEY EMOTION_KEY | --render-stages [--locations FILE] VOICE_KEY TOKENS.tsv NEW_OUTPUT_PREFIX | --render-text [--locations FILE] [--prepare-first] VOICE_KEY INPUT_UTF8.txt NEW_OUTPUT.wav | --render-project [--locations FILE] [--user-dictionary FILE] [--prepare-first] INPUT.vpp NEW_OUTPUT.wav".into());
     }
@@ -287,10 +287,7 @@ fn run(command: &str, args: &[OsString]) -> Result<(), String> {
         return Ok(());
     }
     let value_policy = locations.value_policy();
-    let dictionary = locations
-        .dictionary
-        .ok_or("No pronunciation dictionary is available")?;
-    let mut config = Config::from_catalog(dictionary, &catalog)?;
+    let mut config = Config::from_catalog(locations.dictionary, &catalog)?;
     config.value_policy = value_policy;
     let user_dictionary = match dictionary_path {
         Some(path) => crate::app::dictionary::Snapshot::read(Path::new(path))?,
@@ -318,7 +315,7 @@ fn run(command: &str, args: &[OsString]) -> Result<(), String> {
         }
         let mut project = Project::default();
         project.blocks[0].narrator = crate::app::document::VoiceRef {
-            identity: voice.name.clone(),
+            identity: voice.collection_name.clone(),
             language: "japanese".into(),
             version: crate::app::document::VoiceVersion::Exact(voice.version),
         };
@@ -329,7 +326,7 @@ fn run(command: &str, args: &[OsString]) -> Result<(), String> {
         return Err("Output already exists".into());
     }
     if command == "--render-playback" {
-        return playback::render(config, project, user_dictionary, output_path);
+        return playback::render(config, project, user_dictionary, output_path, prepare_first);
     }
     let narrators: std::collections::BTreeSet<_> =
         project.blocks.iter().map(|b| b.narrator.clone()).collect();

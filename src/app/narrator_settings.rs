@@ -35,8 +35,8 @@ impl EditorApp {
             .into_iter()
             .filter_map(|index| {
                 let voice = &self.catalog.voices[index];
-                let metadata = self.catalog.identity_metadata(&voice.name)?;
-                let primary = self.catalog.identity_source(&voice.name)?;
+                let metadata = self.catalog.identity_metadata(&voice.collection_name)?;
+                let primary = self.catalog.identity_source(&voice.collection_name)?;
                 let controls = metadata
                     .preset_controls
                     .iter()
@@ -49,11 +49,14 @@ impl EditorApp {
                     })
                     .collect();
                 let row = Row {
-                    identity: voice.name.clone(),
+                    identity: voice.collection_name.clone(),
                     instance: primary.key.clone(),
                     name: crate::app::i18n::narrator_name(self.locale, &voice.name).to_owned(),
                     controls,
-                    expanded: self.resources.expanded_corrections.contains(&voice.name),
+                    expanded: self
+                        .resources
+                        .expanded_corrections
+                        .contains(&voice.collection_name),
                     avatar: self.avatar_cache.contains_key(&primary.key),
                 };
                 Some(row)
@@ -182,7 +185,7 @@ impl EditorApp {
             if let Some(draft) = &mut self.resource_draft {
                 draft.expanded_corrections = self.resources.expanded_corrections.clone();
             }
-            if let Err(error) = self.resources.save() {
+            if let Err(error) = self.settings_state.save_now(&self.resources) {
                 self.error = Some(error);
             }
             ui.ctx().request_repaint();

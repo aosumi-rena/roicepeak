@@ -5,6 +5,7 @@ fn number(bits: u64) -> f64 {
     f64::from_bits(bits)
 }
 
+#[inline(always)]
 fn polynomial(x: f64, sine: bool, fused: bool, sine_owner: bool) -> f64 {
     let square = x * x;
     if sine {
@@ -38,6 +39,7 @@ fn polynomial(x: f64, sine: bool, fused: bool, sine_owner: bool) -> f64 {
     }
 }
 
+#[inline(always)]
 fn finish(value: f64, negative: bool, fused: bool) -> f32 {
     let value = if negative {
         if fused {
@@ -51,6 +53,7 @@ fn finish(value: f64, negative: bool, fused: bool) -> f32 {
     value as f32
 }
 
+#[inline(always)]
 fn evaluate(value: f32, sine: bool, fused: bool) -> f32 {
     debug_assert!(value.is_finite());
     let word = value.to_bits();
@@ -149,10 +152,12 @@ fn evaluate(value: f32, sine: bool, fused: bool) -> f32 {
     finish(result, negative, fused)
 }
 
+#[inline(always)]
 pub(super) fn cosine(value: f32, fused: bool) -> f32 {
     evaluate(value, false, fused)
 }
 
+#[inline(always)]
 pub(super) fn sine(value: f32, fused: bool) -> f32 {
     evaluate(value, true, fused)
 }

@@ -127,17 +127,26 @@ impl EditorApp {
                 Ok(())
             }
             SkipStart => {
-                self.playhead = 0.0;
+                self.pending_control_seek = None;
+                self.playhead = self
+                    .project
+                    .blocks
+                    .first()
+                    .map_or(0.0, |block| block.timestamp);
+                self.select_only(0);
+                self.scroll = 0.0;
+                self.playback_scope = crate::app::transport::Scope::Project;
                 self.player.full_range();
-                self.player.seek(0.0);
-                Ok(())
+                self.player.seek_at_or_after(self.playhead);
+                self.resume_after_seek()
             }
             SkipEnd => {
-                self.playhead = self.playback_duration();
-                self.player.pause();
-                self.transport = crate::app::transport::Transport::Paused;
-                self.player.full_range();
-                self.player.seek(self.playhead);
+                if let Some(index) = self.project.blocks.len().checked_sub(1) {
+                    let time = self.project.blocks[index].timestamp;
+                    self.select_only(index);
+                    self.scroll = f32::MAX;
+                    self.seek_to_word(time);
+                }
                 Ok(())
             }
             PreviousBlock => {
@@ -205,13 +214,11 @@ impl EditorApp {
         let Some(index) = adjacent.filter(|index| *index < len) else {
             return;
         };
+        let block = &self.project.blocks[index];
+        let (id, start) = (block.id, block.timestamp);
         self.select_only(index);
-        self.scroll = (index as f32 * 102.0 - 24.0).max(0.0);
-        self.playhead = self.project.blocks[index].timestamp;
-        self.player.pause();
-        self.transport = crate::app::transport::Transport::Paused;
-        self.player.full_range();
-        self.player.seek(self.playhead);
+        self.seek_to_word(start);
+        self.playback_guide.reveal = Some(id);
     }
 
     pub(crate) fn split_text_block(

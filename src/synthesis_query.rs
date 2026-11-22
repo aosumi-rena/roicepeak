@@ -117,7 +117,7 @@ impl Synthesizer {
         budget: &mut Budget,
     ) -> Result<Render> {
         let scalars = self.validate_parameters(params, edits)?;
-        self.render_prepared_impl(prepared, params, edits, budget, false, scalars, None)
+        self.render_prepared_impl(prepared, params, edits, budget, false, scalars, 0, None)
     }
     /// Timings here describe newly performed controls/acoustic/vocoder work only.
     pub fn render_prepared_profiled(
@@ -128,7 +128,7 @@ impl Synthesizer {
         budget: &mut Budget,
     ) -> Result<Render> {
         let scalars = self.validate_parameters(params, edits)?;
-        self.render_prepared_impl(prepared, params, edits, budget, true, scalars, None)
+        self.render_prepared_impl(prepared, params, edits, budget, true, scalars, 0, None)
     }
     pub fn render_prepared_profiled_streamed(
         &self,
@@ -138,8 +138,80 @@ impl Synthesizer {
         budget: &mut Budget,
         emit: &mut dyn FnMut(&[f32]) -> Result<()>,
     ) -> Result<Render> {
+        self.render_prepared_profiled_streamed_at(
+            prepared,
+            params,
+            edits,
+            budget,
+            0,
+            &mut |_, pcm| emit(pcm),
+        )
+        .map(|(_, render)| render)
+    }
+
+    pub fn seek_preroll_samples(&self) -> Option<usize> {
+        let frames = match self.models.acoustic.as_ref() {
+            super::Acoustic::Legacy(model) if model.frame_period == 0.005 => 320,
+            super::Acoustic::Modern(pitch, decoder)
+                if decoder.frame_period == 0.005
+                    && super::AcousticPackets::new(pitch, decoder).is_ok() =>
+            {
+                576
+            }
+            _ => return None,
+        };
+        Some(frames * crate::vocoder::HOP)
+    }
+
+    /// Stream playback and report the first available sample in the sentence.
+    pub fn render_prepared_profiled_streamed_at(
+        &self,
+        prepared: &PreparedQuery,
+        params: &Parameters,
+        edits: &Edits,
+        budget: &mut Budget,
+        target_sample: usize,
+        emit: &mut dyn FnMut(usize, &[f32]) -> Result<()>,
+    ) -> Result<(usize, Render)> {
+        let mut first_frame = if target_sample == 0 {
+            0
+        } else {
+            self.seek_preroll_samples().map_or(0, |preroll| {
+                target_sample.saturating_sub(preroll) / crate::vocoder::HOP
+            })
+        };
         let scalars = self.validate_parameters(params, edits)?;
-        self.render_prepared_impl(prepared, params, edits, budget, true, scalars, Some(emit))
+        if first_frame != 0
+            && self.models.encoder.mandarin_without_tones().is_some()
+            && prepared
+                .encoded
+                .codes
+                .iter()
+                .any(|&code| matches!(code, 0x3001..=0x3004))
+        {
+            prepared.validate(self, edits)?;
+            let controls = self.prepared_controls_impl(prepared, params, edits)?;
+            first_frame = self
+                .mandarin_pitch(prepared, &controls.values, first_frame)
+                .seek_start();
+        }
+        let first_sample = first_frame * crate::vocoder::HOP;
+        let mut cursor = first_sample;
+        let render = self.render_prepared_impl(
+            prepared,
+            params,
+            edits,
+            budget,
+            true,
+            scalars,
+            first_frame,
+            Some(&mut |pcm| {
+                emit(cursor, pcm)?;
+                cursor += pcm.len();
+                Ok(())
+            }),
+        )?;
+        Ok((first_sample, render))
     }
     /// Apply current UI scalar/curve edits to query durations/intonation without audio inference.
     pub fn controls_prepared(
@@ -158,9 +230,9 @@ impl Synthesizer {
         params: &Parameters,
         edits: &Edits,
     ) -> Result<super::Controls> {
-        let period = match &self.acoustic {
+        let period = match self.models.acoustic.as_ref() {
             super::Acoustic::Legacy(model) => model.frame_period,
-            super::Acoustic::Modern(_, model, _, _) => model.frame_period,
+            super::Acoustic::Modern(_, model) => model.frame_period,
         };
         super::prepare_controls(
             &prepared.encoded,
@@ -197,12 +269,12 @@ impl Synthesizer {
                 elapsed
             })
         };
-        let x = self.encoder.encode(tokens)?;
+        let x = self.models.encoder.encode(tokens)?;
         if x.linguistic.rows() < 2 {
             return Err(invalid("render needs boundary phonemes"));
         }
         let encoding_elapsed = stage_elapsed();
-        let lm = self.lm.run_tokens(tokens, budget)?;
+        let lm = self.models.lm.run_tokens(tokens, budget)?;
         let language_elapsed = stage_elapsed();
         let words: Vec<_> = x.references.iter().map(|r| r[0]).collect();
         let predict = edits
@@ -219,28 +291,54 @@ impl Synthesizer {
                 }
                 Ok(x.references
                     .iter()
-                    .map(|r| mask[r[0]][r[1]])
+                    .map(|r| tokens[r[0]].language == 1 && mask[r[0]][r[1]])
                     .collect::<Vec<_>>())
             })
             .transpose()?;
+        let default_mask =
+            (predict.is_none() && tokens.iter().any(|t| matches!(t.language, 2 | 3))).then(|| {
+                x.references
+                    .iter()
+                    .map(|r| tokens[r[0]].language == 1)
+                    .collect::<Vec<_>>()
+            });
         let style = self.stylebook.mix(weights)?;
         let (prosody_style, _) = self.style_inputs(&style.embedding)?;
-        let predicted = self.prosody.run_with_prediction(
+        let predicted = self.models.prosody.run_with_prediction(
             &x.linguistic,
             &lm,
             &words,
-            predict.as_deref(),
+            predict
+                .as_deref()
+                .or(default_mask.as_deref())
+                .map(|mask| (mask, x.codes.as_slice())),
             edits.accent_codes.as_deref(),
             &self.speaker_im,
             &self.speaker_accent,
             prosody_style,
             budget,
         )?;
-        let period = match &self.acoustic {
+        let period = match self.models.acoustic.as_ref() {
             super::Acoustic::Legacy(model) => model.frame_period,
-            super::Acoustic::Modern(_, model, _, _) => model.frame_period,
+            super::Acoustic::Modern(_, model) => model.frame_period,
         };
-        let raw_query_durations = super::duration::raw(&x, &predicted, &style, period)?;
+        let mut raw_query_durations = super::duration::raw(&x, &predicted, &style, period)?;
+        if let Some(language) = self.models.encoder.mandarin_without_tones() {
+            super::mandarin::shorten_neutral(&x, language, period, &mut raw_query_durations);
+        }
+        if tokens
+            .iter()
+            .any(|token| token.language == 3 && token.syllables.len() > 1)
+            && self.models.encoder.english_without_stress().is_some()
+        {
+            super::duration::apply_english_stress(
+                &x,
+                &predicted,
+                tokens,
+                period,
+                &mut raw_query_durations,
+            );
+        }
         let prosody_elapsed = stage_elapsed();
         let timings = started.map(|started| RenderTimings {
             encoding: encoding_elapsed,
