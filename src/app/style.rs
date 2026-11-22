@@ -50,7 +50,7 @@ pub fn card_radius(ui: &Ui, rect: Rect, radius: u8) {
         .rect_stroke(rect, radius, Stroke::new(1.0, BORDER), StrokeKind::Inside);
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Hash)]
 pub enum Icon {
     Menu,
     Book,
@@ -73,6 +73,12 @@ pub enum Icon {
     BlockLoop,
     PresetMore,
     Chevron,
+    Close,
+    Clear,
+    Clock,
+    Up,
+    Down,
+    Person,
 }
 
 pub fn icon(
@@ -91,7 +97,7 @@ pub fn icon_state(
     id: impl std::hash::Hash + std::fmt::Debug,
     rect: Rect,
     kind: Icon,
-    _color: Color32,
+    color: Color32,
     tooltip: &str,
     selected: bool,
 ) -> Response {
@@ -117,11 +123,11 @@ pub fn icon_state(
         };
         ui.painter().rect_filled(rect, 4, background);
     }
-    crate::app::native_icons::paint(ui, rect, kind, selected, over);
+    crate::app::native_icons::paint(ui, rect, kind, color, selected, over);
     response
 }
 
-pub fn draw_icon(ui: &Ui, c: Pos2, kind: Icon, _color: Color32) {
+pub fn draw_icon(ui: &Ui, c: Pos2, kind: Icon, color: Color32) {
     if matches!(kind, Icon::Chevron) {
         // Triangulate the concave chevron from its inward corner.
         let points = [
@@ -147,6 +153,7 @@ pub fn draw_icon(ui: &Ui, c: Pos2, kind: Icon, _color: Color32) {
         ui,
         Rect::from_center_size(c, Vec2::splat(32.0)),
         kind,
+        color,
         false,
         false,
     );

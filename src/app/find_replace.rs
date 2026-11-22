@@ -263,7 +263,7 @@ impl FindReplace {
                 if icon_button(
                     ui,
                     at(308.0, 16.0, 32.0, 32.0),
-                    14,
+                    style::Icon::Close,
                     i18n::tr(locale, "閉じる", "Close"),
                     true,
                 )
@@ -351,7 +351,7 @@ impl FindReplace {
                 if icon_button(
                     ui,
                     at(20.0, 228.0, 32.0, 32.0),
-                    21,
+                    style::Icon::Up,
                     i18n::tr(locale, "前を検索", "Previous"),
                     can_find,
                 )
@@ -362,7 +362,7 @@ impl FindReplace {
                 if icon_button(
                     ui,
                     at(56.0, 228.0, 32.0, 32.0),
-                    42,
+                    style::Icon::Down,
                     i18n::tr(locale, "次を検索", "Next"),
                     can_find,
                 )
@@ -576,7 +576,7 @@ fn text_field(
 fn icon_button(
     ui: &mut egui::Ui,
     rect: Rect,
-    number: u8,
+    icon: style::Icon,
     tooltip: &str,
     enabled: bool,
 ) -> Response {
@@ -584,7 +584,7 @@ fn icon_button(
         let response = ui
             .interact(
                 rect,
-                ui.id().with(("find-icon", number)),
+                ui.id().with(("find-icon", icon)),
                 if enabled {
                     Sense::click()
                 } else {
@@ -594,10 +594,10 @@ fn icon_button(
             .on_hover_text(tooltip);
         response
             .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tooltip));
-        if number != 14 {
+        if !matches!(icon, style::Icon::Close) {
             button_paint(ui, rect, &response, false, enabled);
         }
-        crate::app::native_icons::paint_dialog(ui, rect, number);
+        crate::app::native_icons::paint_dialog(ui, rect, icon);
         response
     })
     .inner

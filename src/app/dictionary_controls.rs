@@ -32,7 +32,7 @@ pub(super) fn search(
         Vec2::splat(24.0),
     );
     if value.is_empty() {
-        native_icons::paint_dialog(ui, icon, 48);
+        native_icons::paint_dialog(ui, icon, style::Icon::Find);
     } else {
         let clear = ui.interact(
             icon,
@@ -46,7 +46,7 @@ pub(super) fn search(
                 i18n::tr(locale, "クリア", "Clear"),
             )
         });
-        native_icons::paint_dialog(ui, icon, 49);
+        native_icons::paint_dialog(ui, icon, style::Icon::Clear);
         if clear.clicked() {
             value.clear();
         }

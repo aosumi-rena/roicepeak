@@ -1,277 +1,269 @@
-//! Renderer for locally supplied icon assets.
-use crate::app::style::Icon;
-use eframe::egui::{self, Color32, Pos2, Rect, Ui, Vec2};
-use std::{
-    collections::BTreeMap,
-    io::Read,
-    path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
-};
+//! Editor control glyphs.
+use crate::app::style::{self, Icon};
+use eframe::egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Ui, Vec2};
 
-struct Asset {
-    number: u8,
-    gray_white: bool,
-    viewport: Vec2,
-    component: Rect,
-    drawable: Rect,
+pub fn paint_dialog(ui: &Ui, rect: Rect, icon: Icon) {
+    paint(ui, rect, icon, style::TEXT, false, false);
 }
 
-impl Asset {
-    fn new(number: u8, viewport: [f32; 2], component: [f32; 4], drawable: [f32; 4]) -> Self {
-        let rect = |v: [f32; 4]| Rect::from_min_size(Pos2::new(v[0], v[1]), Vec2::new(v[2], v[3]));
-        Self {
-            number,
-            gray_white: false,
-            viewport: viewport.into(),
-            component: rect(component),
-            drawable: rect(drawable),
+pub fn paint(ui: &Ui, rect: Rect, icon: Icon, color: Color32, selected: bool, over: bool) {
+    if !rect.is_positive() {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(rect);
+    let color = if ui.is_enabled() {
+        color
+    } else {
+        color.gamma_multiply(0.35)
+    };
+    let mode = matches!(icon, Icon::Accent | Icon::Intonation | Icon::Duration);
+    if mode {
+        let fill = match (selected, over && ui.is_enabled()) {
+            (true, true) => Color32::from_gray(112),
+            (true, false) => style::BAR,
+            (false, true) => Color32::from_gray(232),
+            (false, false) => style::BACKGROUND,
+        };
+        painter.rect(
+            rect.shrink(1.0),
+            4,
+            fill,
+            Stroke::new(1.0, style::BORDER),
+            StrokeKind::Inside,
+        );
+    }
+    let size = rect.width().min(rect.height());
+    let scale = if matches!(icon, Icon::Person) {
+        size
+    } else {
+        size.min(24.0)
+    } / 24.0;
+    let g = Glyph {
+        painter,
+        origin: rect.center() - Vec2::splat(12.0 * scale),
+        scale,
+        color,
+    };
+    match icon {
+        Icon::Menu | Icon::PresetMore => {
+            for y in [6.0, 12.0, 18.0] {
+                g.dot([12.0, y], 1.5);
+            }
         }
+        Icon::Book => {
+            g.outline([5.0, 4.0], [19.0, 20.0], 2.0);
+            g.line(&[[8.0, 5.0], [8.0, 19.0]]);
+            g.line(&[[11.0, 8.0], [16.0, 8.0]]);
+            g.line(&[[11.0, 12.0], [16.0, 12.0]]);
+        }
+        Icon::Find => {
+            g.circle([10.0, 10.0], 5.5);
+            g.line(&[[14.0, 14.0], [19.0, 19.0]]);
+        }
+        Icon::Speed => {
+            g.line(&[
+                [4.0, 17.0],
+                [4.6, 12.5],
+                [7.5, 8.5],
+                [12.0, 7.0],
+                [16.5, 8.5],
+                [19.4, 12.5],
+                [20.0, 17.0],
+            ]);
+            g.line(&[[12.0, 16.0], [16.0, 11.0]]);
+            g.dot([12.0, 16.0], 1.5);
+        }
+        Icon::Pitch => {
+            g.line(&[[9.0, 17.0], [9.0, 6.0], [18.0, 4.0], [18.0, 15.0]]);
+            g.dot([7.5, 17.5], 2.5);
+            g.dot([16.5, 15.5], 2.5);
+        }
+        Icon::Pause => {
+            g.clock([8.0, 9.0], 4.5);
+            g.line(&[[12.0, 17.0], [19.0, 17.0]]);
+            g.line(&[[15.0, 13.0], [19.0, 13.0]]);
+        }
+        Icon::Volume => {
+            g.polygon(&[
+                [4.0, 9.0],
+                [7.0, 9.0],
+                [12.0, 5.0],
+                [12.0, 19.0],
+                [7.0, 15.0],
+                [4.0, 15.0],
+            ]);
+            g.line(&[[15.0, 9.0], [16.0, 10.5], [16.0, 13.5], [15.0, 15.0]]);
+            g.line(&[
+                [17.5, 6.5],
+                [19.5, 9.0],
+                [20.0, 12.0],
+                [19.5, 15.0],
+                [17.5, 17.5],
+            ]);
+        }
+        Icon::Emotion => {
+            g.circle([12.0, 12.0], 8.0);
+            g.dot([9.0, 10.0], 1.0);
+            g.dot([15.0, 10.0], 1.0);
+            g.line(&[
+                [8.5, 14.0],
+                [10.0, 15.5],
+                [12.0, 16.0],
+                [14.0, 15.5],
+                [15.5, 14.0],
+            ]);
+        }
+        Icon::Previous | Icon::Next => {
+            let mirror = |x| {
+                if matches!(icon, Icon::Previous) {
+                    24.0 - x
+                } else {
+                    x
+                }
+            };
+            g.polygon(&[
+                [mirror(6.0), 5.0],
+                [mirror(16.0), 12.0],
+                [mirror(6.0), 19.0],
+            ]);
+            g.line(&[[mirror(18.0), 5.0], [mirror(18.0), 19.0]]);
+        }
+        Icon::Play => g.polygon(&[[7.0, 4.5], [20.0, 12.0], [7.0, 19.5]]),
+        Icon::Loop | Icon::BlockLoop => {
+            g.line(&[[5.0, 11.0], [5.0, 9.0], [7.0, 7.0], [19.0, 7.0]]);
+            g.line(&[[16.0, 4.0], [19.0, 7.0], [16.0, 10.0]]);
+            g.line(&[[19.0, 13.0], [19.0, 15.0], [17.0, 17.0], [5.0, 17.0]]);
+            g.line(&[[8.0, 14.0], [5.0, 17.0], [8.0, 20.0]]);
+        }
+        Icon::Undo | Icon::Redo => {
+            let mirror = |x| {
+                if matches!(icon, Icon::Redo) {
+                    24.0 - x
+                } else {
+                    x
+                }
+            };
+            g.line(&[[mirror(8.0), 5.0], [mirror(4.0), 9.0], [mirror(8.0), 13.0]]);
+            g.line(&[
+                [mirror(4.0), 9.0],
+                [mirror(14.0), 9.0],
+                [mirror(18.0), 11.0],
+                [mirror(19.0), 14.0],
+                [mirror(17.0), 17.0],
+                [mirror(13.0), 19.0],
+            ]);
+        }
+        Icon::Delete => {
+            g.line(&[[5.0, 7.0], [19.0, 7.0]]);
+            g.line(&[[9.0, 7.0], [9.0, 4.0], [15.0, 4.0], [15.0, 7.0]]);
+            g.line(&[[7.0, 7.0], [8.0, 20.0], [16.0, 20.0], [17.0, 7.0]]);
+            g.line(&[[12.0, 10.0], [12.0, 17.0]]);
+        }
+        Icon::Accent => {
+            g.line(&[
+                [5.0, 14.0],
+                [10.0, 14.0],
+                [10.0, 8.0],
+                [17.0, 8.0],
+                [17.0, 16.0],
+                [20.0, 16.0],
+            ]);
+            g.dot([5.0, 14.0], 1.5);
+            g.dot([20.0, 16.0], 1.5);
+        }
+        Icon::Intonation => {
+            g.line(&[
+                [5.0, 17.0],
+                [7.0, 13.5],
+                [10.0, 11.0],
+                [14.0, 9.5],
+                [19.0, 6.5],
+            ]);
+            g.dot([5.0, 17.0], 1.7);
+            g.dot([19.0, 6.5], 1.7);
+        }
+        Icon::Duration => {
+            g.outline([9.0, 5.0], [15.0, 19.0], 1.0);
+            g.line(&[[6.0, 8.0], [3.0, 12.0], [6.0, 16.0]]);
+            g.line(&[[18.0, 8.0], [21.0, 12.0], [18.0, 16.0]]);
+        }
+        Icon::Close | Icon::Clear => {
+            if matches!(icon, Icon::Clear) {
+                g.circle([12.0, 12.0], 8.0);
+            }
+            g.line(&[[8.5, 8.5], [15.5, 15.5]]);
+            g.line(&[[15.5, 8.5], [8.5, 15.5]]);
+        }
+        Icon::Clock => g.clock([12.0, 12.0], 7.0),
+        Icon::Up => g.line(&[[5.0, 15.0], [12.0, 8.5], [19.0, 15.0]]),
+        Icon::Down => g.line(&[[5.0, 9.0], [12.0, 15.5], [19.0, 9.0]]),
+        Icon::Person => {
+            g.circle([12.0, 7.0], 4.0);
+            g.line(&[
+                [4.0, 21.0],
+                [4.0, 18.0],
+                [5.5, 15.5],
+                [8.5, 14.0],
+                [15.5, 14.0],
+                [18.5, 15.5],
+                [20.0, 18.0],
+                [20.0, 21.0],
+            ]);
+        }
+        Icon::Chevron => g.line(&[[7.0, 10.0], [12.0, 14.0], [17.0, 10.0]]),
     }
 }
 
-type IconCache = BTreeMap<(u8, bool), Option<Arc<[u8]>>>;
-static CACHE: OnceLock<Mutex<IconCache>> = OnceLock::new();
-
-pub fn install(ctx: &egui::Context) {
-    egui_extras::install_image_loaders(ctx);
+struct Glyph {
+    painter: Painter,
+    origin: Pos2,
+    scale: f32,
+    color: Color32,
 }
 
-pub fn directory() -> Option<PathBuf> {
-    Some(
-        std::env::current_exe()
-            .ok()?
-            .parent()?
-            .join("resources")
-            .join("ui"),
-    )
-}
-
-fn bytes(number: u8, gray_white: bool) -> Option<Arc<[u8]>> {
-    let mut cache = CACHE.get_or_init(Default::default).lock().ok()?;
-    cache
-        .entry((number, gray_white))
-        .or_insert_with(|| {
-            let path = directory()?.join(format!("image-{number:03}.svg"));
-            let file = std::fs::File::open(path).ok()?;
-            let mut data = Vec::new();
-            file.take(256 * 1024 + 1).read_to_end(&mut data).ok()?;
-            if data.len() > 256 * 1024 {
-                return None;
-            }
-            if gray_white {
-                if !matches!(number, 16 | 49) {
-                    return None;
-                }
-                let svg = std::str::from_utf8(&data).ok()?;
-                let white = "fill=\"white\"";
-                if svg.matches(white).count() != 1 {
-                    return None;
-                }
-                Some(Arc::from(
-                    svg.replacen(white, "fill=\"#666666\"", 1).into_bytes(),
-                ))
-            } else if matches!(number, 12 | 53) {
-                let svg = std::str::from_utf8(&data).ok()?;
-                let black = "fill=\"black\"";
-                if svg.matches(black).count() != 1 {
-                    return None;
-                }
-                Some(Arc::from(
-                    svg.replacen(black, "fill=\"#666666\"", 1).into_bytes(),
-                ))
-            } else {
-                Some(Arc::from(data))
-            }
-        })
-        .clone()
-}
-
-fn toolbar_asset(kind: Icon) -> Option<Asset> {
-    let full = |number| {
-        Asset::new(
-            number,
-            [32.0, 32.0],
-            [0.0, 0.0, 32.0, 32.0],
-            [0.0, 0.0, 32.0, 32.0],
-        )
-    };
-    Some(match kind {
-        Icon::Menu => Asset::new(
-            52,
-            [19.0, 18.0],
-            [8.0, 3.0, 4.0, 13.0],
-            [8.39648, 3.0, 3.00002, 13.0],
-        ),
-        Icon::Book => Asset::new(
-            5,
-            [19.0, 18.0],
-            [2.0, 1.0, 15.0, 17.0],
-            [2.89648, 1.5, 14.00002, 16.0],
-        ),
-        Icon::Find => Asset::new(
-            41,
-            [24.0, 24.0],
-            [3.0, 4.0, 17.0, 17.0],
-            [3.0, 4.0, 16.0938, 16.125],
-        ),
-        Icon::Volume => Asset::new(
-            18,
-            [33.0, 32.0],
-            [7.0, 8.0, 18.0, 16.0],
-            [7.09277, 8.9375, 17.00003, 14.1563],
-        ),
-        Icon::Loop => Asset::new(
-            33,
-            [24.0, 24.0],
-            [2.0, 2.0, 20.0, 21.0],
-            [2.5, 2.16992, 19.0, 20.41018],
-        ),
-        Icon::Speed => full(47),
-        Icon::Pitch => full(1),
-        Icon::Pause => full(15),
-        Icon::Emotion => full(6),
-        Icon::Previous => full(24),
-        Icon::Play => full(10),
-        Icon::Next => full(45),
-        Icon::Undo => full(16),
-        Icon::Redo => full(31),
-        Icon::Delete => Asset::new(
-            9,
-            [14.0, 17.0],
-            [0.0, 0.0, 14.0, 17.0],
-            [0.0, 0.5, 14.0, 16.0],
-        ),
-        Icon::BlockLoop => Asset::new(
-            23,
-            [24.0, 24.0],
-            [4.0, 3.0, 16.0, 18.0],
-            [4.0, 3.5078125, 16.0, 16.984362],
-        ),
-        Icon::PresetMore => Asset::new(
-            53,
-            [24.0, 24.0],
-            [10.0, 5.0, 4.0, 13.0],
-            [10.5, 5.0, 3.0, 13.0],
-        ),
-        // Unsupported widget states have no icon mapping.
-        Icon::Chevron | Icon::Accent | Icon::Intonation | Icon::Duration => return None,
-    })
-}
-
-fn mode_asset(kind: Icon, selected: bool, over: bool) -> Option<Asset> {
-    let choices = match kind {
-        Icon::Accent => [2, 20, 43, 28],
-        Icon::Intonation => [13, 11, 22, 34],
-        Icon::Duration => [27, 4, 7, 44],
-        _ => return None,
-    };
-    let state = usize::from(selected) * 2 + usize::from(over);
-    let (viewport, bounds) = match state {
-        0 => ([36.0, 36.0], [0.0, 0.0, 37.0, 37.0]),
-        1 | 2 => ([66.0, 66.0], [15.0, 13.0, 36.0, 36.0]),
-        _ => ([36.0, 36.0], [0.0, 0.0, 36.0, 36.0]),
-    };
-    Some(Asset::new(choices[state], viewport, bounds, bounds))
-}
-
-/// Returns false when the requested asset or geometry is unavailable.
-pub fn paint(ui: &Ui, rect: Rect, kind: Icon, selected: bool, over: bool) -> bool {
-    let mode = mode_asset(kind, selected, over);
-    let is_mode = mode.is_some();
-    let Some(asset) = mode.or_else(|| toolbar_asset(kind)) else {
-        return false;
-    };
-    paint_asset(ui, rect, asset, is_mode)
-}
-
-pub fn paint_dialog(ui: &Ui, rect: Rect, number: u8) -> bool {
-    let mut asset = match number {
-        12 => Asset::new(
-            12,
-            [12.0, 13.0],
-            [0.0, 0.0, 12.0, 13.0],
-            [0.0, 0.0, 12.0, 13.0],
-        ),
-        35 => Asset::new(
-            35,
-            [14.0, 14.0],
-            [0.0, 0.0, 14.0, 14.0],
-            [0.0, 0.0, 14.0, 14.0],
-        ),
-        16 => Asset::new(
-            16,
-            [32.0, 32.0],
-            [0.0, 0.0, 32.0, 32.0],
-            [0.0, 0.0, 32.0, 32.0],
-        ),
-        48 => Asset::new(
-            48,
-            [17.0, 17.0],
-            [0.0, 0.0, 17.0, 17.0],
-            [0.0, 0.0, 17.0, 17.0],
-        ),
-        49 => Asset::new(
-            49,
-            [24.0, 24.0],
-            [0.0, 0.0, 24.0, 24.0],
-            [0.0, 0.0, 24.0, 24.0],
-        ),
-        14 => Asset::new(
-            14,
-            [24.0, 24.0],
-            [0.0, 0.0, 24.0, 24.0],
-            [0.0, 0.0, 24.0, 24.0],
-        ),
-        21 => Asset::new(
-            21,
-            [24.0, 24.0],
-            [5.0, 7.0, 14.0, 9.0],
-            [5.234375, 7.7578125, 13.5078, 7.5078373],
-        ),
-        42 => Asset::new(
-            42,
-            [24.0, 24.0],
-            [5.0, 9.0, 14.0, 9.0],
-            [5.234375, 9.7578125, 13.5078, 7.5078373],
-        ),
-        _ => return false,
-    };
-    asset.gray_white = matches!(number, 16 | 49);
-    paint_asset(ui, rect, asset, false)
-}
-
-fn paint_asset(ui: &Ui, rect: Rect, asset: Asset, is_mode: bool) -> bool {
-    let Some(data) = bytes(asset.number, asset.gray_white) else {
-        return false;
-    };
-    let remaining = (rect.size() - asset.component.size()) * 0.5;
-    let offset = Vec2::new(remaining.x.trunc(), remaining.y.trunc());
-    let (origin, scale) = if is_mode {
-        (rect.min + offset - asset.component.min.to_vec2(), 1.0)
-    } else {
-        // Fit and center the drawable proportionally in the integer rectangle.
-        let target = Rect::from_min_size(rect.min + offset, rect.size() - 2.0 * offset);
-        let scale = (target.width() / asset.drawable.width())
-            .min(target.height() / asset.drawable.height());
-        (
-            target.center() - asset.drawable.center().to_vec2() * scale,
-            scale,
-        )
-    };
-    let opacity = if ui.is_enabled() { 255 } else { 77 };
-    egui::Image::from_bytes(
-        format!(
-            "bytes://reference-ui/image-{:03}-{}.svg",
-            asset.number,
-            if asset.gray_white {
-                "dialog"
-            } else {
-                "original"
-            }
-        ),
-        data,
-    )
-    .tint(Color32::from_white_alpha(opacity))
-    .paint_at(ui, Rect::from_min_size(origin, asset.viewport * scale));
-    true
+impl Glyph {
+    fn point(&self, point: [f32; 2]) -> Pos2 {
+        self.origin + Vec2::from(point) * self.scale
+    }
+    fn stroke(&self) -> Stroke {
+        Stroke::new(1.8 * self.scale, self.color)
+    }
+    fn line(&self, points: &[[f32; 2]]) {
+        self.painter.add(Shape::line(
+            points.iter().map(|&point| self.point(point)).collect(),
+            self.stroke(),
+        ));
+    }
+    fn polygon(&self, points: &[[f32; 2]]) {
+        self.painter.add(Shape::convex_polygon(
+            points.iter().map(|&point| self.point(point)).collect(),
+            self.color,
+            Stroke::NONE,
+        ));
+    }
+    fn circle(&self, center: [f32; 2], radius: f32) {
+        self.painter
+            .circle_stroke(self.point(center), radius * self.scale, self.stroke());
+    }
+    fn dot(&self, center: [f32; 2], radius: f32) {
+        self.painter
+            .circle_filled(self.point(center), radius * self.scale, self.color);
+    }
+    fn outline(&self, min: [f32; 2], max: [f32; 2], radius: f32) {
+        self.painter.rect_stroke(
+            Rect::from_min_max(self.point(min), self.point(max)),
+            (radius * self.scale).round() as u8,
+            self.stroke(),
+            StrokeKind::Inside,
+        );
+    }
+    fn clock(&self, center: [f32; 2], radius: f32) {
+        self.circle(center, radius);
+        let [x, y] = center;
+        self.line(&[
+            [x, y - radius * 0.55],
+            center,
+            [x + radius * 0.4, y + radius * 0.25],
+        ]);
+    }
 }

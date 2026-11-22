@@ -113,7 +113,7 @@ pub fn run() -> eframe::Result {
         "ROICEPEAK",
         options,
         Box::new(move |cc| {
-            native_icons::install(&cc.egui_ctx);
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(editor::EditorApp::new(cc, locations)))
         }),
     )

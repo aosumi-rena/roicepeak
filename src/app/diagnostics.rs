@@ -277,7 +277,6 @@ fn run(command: &str, args: &[OsString]) -> Result<(), String> {
                 "emotions":voice.binding.emotion_bindings.iter().map(|control| json!({"label":control.label,"key":control.key})).collect::<Vec<_>>()
             })).collect::<Vec<_>>(),
             "problems":catalog.problems,"dictionary":locations.dictionary,
-            "native_ui_icon_directory":crate::app::native_icons::directory(),
             "locales":crate::app::i18n::coverage(),
             "picker_order":ordered.into_iter().map(|index| catalog.voices[index].key.clone()).collect::<Vec<_>>(),
         });

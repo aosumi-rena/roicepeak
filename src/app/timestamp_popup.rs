@@ -44,7 +44,7 @@ pub(crate) fn button(ui: &mut egui::Ui, block: &Block, at: Pos2, color: Color32)
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, 4, Color32::from_rgba_unmultiplied(153, 153, 153, 51));
-        crate::app::native_icons::paint_dialog(ui, rect, 35);
+        crate::app::native_icons::paint_dialog(ui, rect, style::Icon::Clock);
     } else {
         ui.painter().with_clip_rect(rect).text(
             rect.center(),
@@ -147,7 +147,7 @@ pub(crate) fn show(app: &mut EditorApp, ui: &egui::Ui, ctx: &egui::Context, scre
                 Id::new("timestamp-reset"),
                 Sense::click(),
             );
-            crate::app::native_icons::paint_dialog(ui, reset.rect, 12);
+            crate::app::native_icons::paint_dialog(ui, reset.rect, style::Icon::Undo);
             let reset = crate::app::root_tooltip::attach(reset, tr("Reset"));
             if reset.clicked() {
                 draft.edit = None;

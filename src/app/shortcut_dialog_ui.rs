@@ -89,7 +89,7 @@ pub(super) fn show(state: &mut State, app: &mut EditorApp, ctx: &egui::Context, 
                         search_rect.right_center() - Vec2::new(24.0, 0.0),
                         Vec2::splat(16.0),
                     ),
-                    48,
+                    style::Icon::Find,
                 );
             } else {
                 let clear =
@@ -99,7 +99,7 @@ pub(super) fn show(state: &mut State, app: &mut EditorApp, ctx: &egui::Context, 
                     ui.painter()
                         .rect_filled(clear, 4, Color32::from_black_alpha(20));
                 }
-                crate::app::native_icons::paint_dialog(ui, clear, 49);
+                crate::app::native_icons::paint_dialog(ui, clear, style::Icon::Clear);
                 if response.clicked() {
                     state.search.clear();
                     changed = true;
@@ -374,7 +374,7 @@ fn row_ui(
             ui.painter()
                 .rect_filled(reset, 4, Color32::from_black_alpha(20));
         }
-        crate::app::native_icons::paint_dialog(ui, reset, 16);
+        crate::app::native_icons::paint_dialog(ui, reset, style::Icon::Undo);
         if reset_response.clicked() {
             state.select(map, slot);
             state.default_draft(slot);

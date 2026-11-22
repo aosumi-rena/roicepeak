@@ -16,7 +16,7 @@ impl EditorApp {
         let title = self.tr("辞書", "Dictionary");
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, title));
         style::button_paint(ui, rect, &response, false, true);
-        native_icons::paint(ui, rect, style::Icon::PresetMore, false, response.hovered());
+        native_icons::paint_dialog(ui, rect, style::Icon::PresetMore);
         let clicked = response.clicked();
         if clicked && egui::Popup::is_id_open(ui.ctx(), id) {
             native_menu::close(ui.ctx(), id);

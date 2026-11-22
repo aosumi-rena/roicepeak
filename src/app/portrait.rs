@@ -4,12 +4,9 @@ mod state;
 #[path = "portrait_view.rs"]
 mod view;
 use crate::app::catalog::Voice;
+use crate::app::style::{self, Icon};
 use eframe::egui::{self, Color32, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 pub use state::State;
-use std::{
-    io::Read,
-    sync::{Arc, OnceLock},
-};
 
 pub const PANEL_WIDTH: f32 = 308.0;
 pub const INSET: f32 = 24.0;
@@ -107,11 +104,14 @@ fn paint(
     if let Some((image, rect)) = image.zip(image_rect) {
         egui::Image::from_bytes(image.uri.clone(), image.portrait.bytes.clone())
             .paint_at(&image_ui, rect);
-    } else if let Some(bytes) = placeholder_asset() {
-        // Center the placeholder at its intrinsic size.
-        egui::Image::from_bytes("bytes://reference-ui/image-008.svg", bytes).paint_at(
+    } else {
+        crate::app::native_icons::paint(
             &image_ui,
-            Rect::from_center_size(card.center(), Vec2::new(40.0, 57.0)),
+            Rect::from_center_size(card.center(), Vec2::splat(40.0)),
+            Icon::Person,
+            Color32::from_gray(158),
+            false,
+            false,
         );
     }
     ui.painter().rect_stroke(
@@ -132,44 +132,10 @@ fn paint(
         ui.painter()
             .rect_filled(close, 4, Color32::from_black_alpha(13));
     }
-    if let (Some(voice), Some(bytes)) = (voice, close_asset()) {
+    let color = voice.map_or(style::TEXT, |voice| {
         let [r, g, b] = voice.color;
-        egui::Image::from_bytes("bytes://reference-ui/image-038.svg", bytes)
-            .tint(Color32::from_rgba_unmultiplied(
-                r,
-                g,
-                b,
-                if ui.is_enabled() { 204 } else { 61 },
-            ))
-            .paint_at(ui, close);
-    }
+        Color32::from_rgba_unmultiplied(r, g, b, 204)
+    });
+    crate::app::native_icons::paint(ui, close, Icon::Close, color, false, false);
     menu_close || response.clicked()
-}
-
-fn close_asset() -> Option<Arc<[u8]>> {
-    static BYTES: OnceLock<Option<Arc<[u8]>>> = OnceLock::new();
-    BYTES
-        .get_or_init(|| {
-            let file =
-                std::fs::File::open(crate::app::native_icons::directory()?.join("image-038.svg"))
-                    .ok()?;
-            let mut bytes = Vec::new();
-            file.take(4097).read_to_end(&mut bytes).ok()?;
-            (bytes.len() <= 4096).then(|| Arc::from(bytes))
-        })
-        .clone()
-}
-
-fn placeholder_asset() -> Option<Arc<[u8]>> {
-    static BYTES: OnceLock<Option<Arc<[u8]>>> = OnceLock::new();
-    BYTES
-        .get_or_init(|| {
-            let file =
-                std::fs::File::open(crate::app::native_icons::directory()?.join("image-008.svg"))
-                    .ok()?;
-            let mut bytes = Vec::new();
-            file.take(4097).read_to_end(&mut bytes).ok()?;
-            (bytes.len() <= 4096).then(|| Arc::from(bytes))
-        })
-        .clone()
 }
